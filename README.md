@@ -1,168 +1,126 @@
-# Sync Guardian for OBS Studio
+# Sync Guardian
 
-Sync Guardian is an experimental OBS Studio dock plugin for monitoring and recovering DistroAV/NDI receiver sources.
+Sync Guardian is an experimental OBS Studio dock for monitoring DistroAV/NDI receiver sources, detecting possible synchronization problems, and providing targeted recovery controls.
 
-It tracks incoming video and audio timing, detects sustained stalls or changes in their normal timestamp relationship, records diagnostics, and can rebuild an affected DistroAV receiver while restoring its original source settings.
-
-> Install Sync Guardian on the **receiving/streaming PC** where the NDI sources are added to OBS.
+Install it on the **receiving/streaming PC** where the NDI sources are added to OBS.
 
 ## Features
 
-- Monitors one NDI video source and up to two NDI audio sources
-- Tracks packet age, timestamp movement, and estimated A/V offset
-- Establishes a normal timing baseline automatically
-- Detects persistent drift, video stalls, and audio stalls
-- Supports manual, confirmation-based, or automatic recovery
-- Applies cooldowns and reset limits to avoid repeated recovery loops
-- Logs events and incident diagnostics
-- Preserves the original DistroAV source settings after a reset
+- Monitors one NDI video source, one desktop-audio source, and one microphone source
+- Estimates video-to-audio timestamp drift from a calibrated baseline
+- Detects stalled video or audio sources
+- Shows a short current and session-history health summary
+- Highlights the most likely manual recovery button when an issue is detected
+- Provides targeted resets for video, individual audio sources, both audio sources, or the entire NDI group
+- Supports **Observe only**, **Ask before resetting**, and **Fully automatic** modes
+- Includes cooldowns, reset limits, grace periods, and recovery verification
+- Uses a compact, scrollable dock suitable for 1080p displays
+
+## Install
+
+Download and extract the compiled Windows artifact.
+
+The extracted package should contain:
+
+```text
+obs-plugins\
+  64bit\
+    sync-guardian.dll
+
+data\
+  obs-plugins\
+    sync-guardian\
+      locale\
+        en-US.ini
+```
+
+1. Close OBS completely.
+2. Select the extracted `obs-plugins` and `data` folders.
+3. Drag both folders into:
+
+```text
+C:\Program Files\obs-studio\
+```
+
+4. Allow Windows to merge the folders and replace files when updating.
+5. Start OBS.
+6. Open **Docks → Sync Guardian**.
+
+The DLL should end up at:
+
+```text
+C:\Program Files\obs-studio\obs-plugins\64bit\sync-guardian.dll
+```
+
+Do not place the plugin DLL in `bin\64bit`.
+
+## Initial setup
+
+1. Open **Docks → Sync Guardian**.
+2. Click **Refresh Source List**.
+3. Map the NDI video, desktop-audio, and microphone receiver sources.
+4. Leave the mode on **Observe only** during initial testing.
+5. Allow the sources to run long enough for Sync Guardian to establish a stable baseline.
+6. Test each manual recovery action during a non-critical recording before enabling automatic recovery.
 
 ## Operating modes
 
-| Mode | Behavior |
-|---|---|
-| **Observe only** | Monitors and logs without changing sources. |
-| **Ask before resetting** | Requests confirmation before performing recovery. |
-| **Fully automatic** | Performs a targeted reset after a problem remains active long enough. |
+- **Observe only** — monitors and reports issues without resetting anything.
+- **Ask before resetting** — recommends a recovery action and asks for confirmation.
+- **Fully automatic** — performs a targeted recovery after an issue remains beyond the configured thresholds.
 
-Start with **Observe only** until the source mappings and reported timing values have been verified.
+A single timestamp jump does not trigger an automatic reset by itself.
 
-## Installation
+## Updating
 
-The current GitHub Actions artifact may place the compiled DLL here:
-
-```text
-bin\64bit\sync-guardian.dll
-```
-
-That is the artifact's build-output layout. **Do not copy its `bin` folder into OBS.** OBS loads third-party plugin modules from `obs-plugins\64bit`.
-
-1. Close OBS completely.
-2. Extract the downloaded artifact and any ZIP contained inside it.
-3. Copy:
+1. Download and extract the new compiled artifact.
+2. Close OBS completely.
+3. Drag the new `obs-plugins` and `data` folders into:
 
 ```text
-bin\64bit\sync-guardian.dll
+C:\Program Files\obs-studio\
 ```
 
-into:
+4. Approve folder merging and file replacement.
+5. Restart OBS.
 
-```text
-C:\Program Files\obs-studio\obs-plugins\64bit\
-```
+Existing Sync Guardian mappings and settings should remain in the OBS plugin configuration directory.
 
-4. Copy the artifact's folder:
+## Building with GitHub Actions
 
-```text
-data\obs-plugins\sync-guardian\
-```
+The repository includes a Windows build workflow.
 
-into:
+1. Upload the repository files to GitHub.
+2. Open **Actions → Build Sync Guardian for Windows**.
+3. Run the workflow or wait for it to start after a commit.
+4. Open the successful workflow run.
+5. Download the Windows x64 artifact from the **Artifacts** section.
+6. Follow the installation steps above.
 
-```text
-C:\Program Files\obs-studio\data\obs-plugins\sync-guardian\
-```
-
-5. Confirm these final paths exist:
-
-```text
-C:\Program Files\obs-studio\obs-plugins\64bit\sync-guardian.dll
-C:\Program Files\obs-studio\data\obs-plugins\sync-guardian\locale\en-US.ini
-```
-
-6. Start OBS on the receiving/streaming PC and open **Docks → Sync Guardian**.
-
-If `sync-guardian.dll` was previously copied to `C:\Program Files\obs-studio\bin\64bit`, remove that copy after placing it in `obs-plugins\64bit`.
-
-## Setup
-
-1. Create the required DistroAV receiver sources in OBS.
-2. Open **Docks → Sync Guardian**.
-3. Click **Refresh Source List**.
-4. Select the appropriate video and audio sources.
-5. Leave the mode on **Observe only** while the baseline calibrates.
-6. Test the manual reset controls before enabling automatic recovery.
-
-## How recovery works
-
-Sync Guardian briefly changes a DistroAV receiver setting that causes the receiver to rebuild, then restores the complete original source configuration.
-
-Recovery can target:
-
-- Video only
-- Desktop audio only
-- Microphone only
-- Both audio sources
-- The complete mapped source group
-
-Automatic recovery is intentionally conservative. A brief timestamp irregularity alone is not enough to trigger a reset.
-
-## Understanding the A/V estimate
-
-The displayed A/V value is based on source timestamps and callback timing. It is most useful for detecting a change from the calibrated baseline.
-
-It is not direct analysis of the visible picture or audible content, and it does not expose the exact internal OBS audio-buffer or DistroAV FrameSync queue depth.
-
-## Logs
-
-Configuration and diagnostic files are normally stored under:
-
-```text
-%APPDATA%\obs-studio\plugin_config\sync-guardian\
-```
-
-The main OBS log includes entries beginning with:
-
-```text
-[sync-guardian]
-```
-
-Open it through **Help → Log Files → View Current Log**.
+No local Visual Studio, CMake, Qt, or OBS SDK installation is required when using GitHub Actions.
 
 ## Troubleshooting
 
-### The dock does not appear
+### Sync Guardian is not listed under Docks
 
-- Confirm the DLL is in `obs-plugins\64bit`.
-- Restart OBS completely.
-- Check the DLL properties for an **Unblock** option.
-- Search the OBS log for `sync-guardian` or `Failed to load module`.
-
-### The source list is empty
-
-- Confirm the plugin is installed on the receiving PC.
-- Confirm the DistroAV receiver sources already exist in OBS.
-- Click **Refresh Source List**.
-- Confirm DistroAV loaded successfully in the OBS log.
-
-### Automatic recovery does not run
-
-A grace period, persistence timer, cooldown, inactive source, inactive output, or hourly reset limit may be preventing recovery. Review the dock status and event log.
-
-## Building from source
-
-The repository includes a GitHub Actions workflow for building the Windows x64 plugin.
-
-1. Open the repository's **Actions** tab.
-2. Run **Build Sync Guardian for Windows**.
-3. Download the completed Windows artifact.
-4. Install the resulting `obs-plugins` and `data` folders as described above.
-
-## Uninstall
-
-Close OBS and remove:
+Confirm the DLL is located at:
 
 ```text
 C:\Program Files\obs-studio\obs-plugins\64bit\sync-guardian.dll
-C:\Program Files\obs-studio\data\obs-plugins\sync-guardian\
 ```
 
-Saved configuration and logs may also be removed from:
+Then open **Help → Log Files → View Current Log** and search for `sync-guardian`.
 
-```text
-%APPDATA%\obs-studio\plugin_config\sync-guardian\
-```
+### NDI sources do not appear in the mapping lists
 
-## Disclaimer
+- Confirm the plugin is installed on the receiving/streaming PC.
+- Confirm the DistroAV receiver sources already exist in OBS.
+- Click **Refresh Source List**.
 
-Sync Guardian is an independent experimental project and is not affiliated with or endorsed by OBS Studio, DistroAV, or NDI. Test recovery behavior before relying on it in a live production environment.
+### The interface does not fit
+
+The dock is vertically scrollable. Make sure **Docks → Lock Docks** is disabled if you need to resize or reposition it.
+
+## Status
+
+Sync Guardian is experimental. Use **Observe only** first and validate detection and manual recovery behavior before relying on automatic recovery during an important stream.
