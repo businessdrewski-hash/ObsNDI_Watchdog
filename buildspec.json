@@ -32,5 +32,11 @@
   "displayName": "Sync Guardian",
   "version": "0.2.0",
   "author": "Sync Guardian contributors",
-  "website": "https://github.com"
+  "website": "https://github.com",
+  "platformConfig": {
+    "macos": {
+      "bundleId": "com.businessdrewski.syncguardian"
+    }
+  },
+  "email": "noreply@example.com"
 }
