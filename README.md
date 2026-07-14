@@ -29,30 +29,50 @@ Start with **Observe only** until the source mappings and reported timing values
 
 ## Installation
 
-A compiled package should contain:
+The current GitHub Actions artifact may place the compiled DLL here:
 
 ```text
-obs-plugins\64bit\sync-guardian.dll
-data\obs-plugins\sync-guardian\locale\en-US.ini
+bin\64bit\sync-guardian.dll
 ```
+
+That is the artifact's build-output layout. **Do not copy its `bin` folder into OBS.** OBS loads third-party plugin modules from `obs-plugins\64bit`.
 
 1. Close OBS completely.
-2. Extract the downloaded plugin package.
-3. Copy the included `obs-plugins` and `data` folders into:
+2. Extract the downloaded artifact and any ZIP contained inside it.
+3. Copy:
 
 ```text
-C:\Program Files\obs-studio\
+bin\64bit\sync-guardian.dll
 ```
 
-4. Confirm the DLL is located at:
+into:
+
+```text
+C:\Program Files\obs-studio\obs-plugins\64bit\
+```
+
+4. Copy the artifact's folder:
+
+```text
+data\obs-plugins\sync-guardian\
+```
+
+into:
+
+```text
+C:\Program Files\obs-studio\data\obs-plugins\sync-guardian\
+```
+
+5. Confirm these final paths exist:
 
 ```text
 C:\Program Files\obs-studio\obs-plugins\64bit\sync-guardian.dll
+C:\Program Files\obs-studio\data\obs-plugins\sync-guardian\locale\en-US.ini
 ```
 
-5. Start OBS and open **Docks → Sync Guardian**.
+6. Start OBS on the receiving/streaming PC and open **Docks → Sync Guardian**.
 
-Do not place the plugin DLL in `bin\64bit`.
+If `sync-guardian.dll` was previously copied to `C:\Program Files\obs-studio\bin\64bit`, remove that copy after placing it in `obs-plugins\64bit`.
 
 ## Setup
 
