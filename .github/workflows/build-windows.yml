@@ -65,10 +65,15 @@ jobs:
           New-Item -ItemType Directory -Force $distRoot | Out-Null
 
           $dll = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter 'sync-guardian.dll' |
-            Where-Object { $_.FullName -notmatch '\.deps\' -and $_.FullName -notmatch '\obs-install\' -and $_.FullName -notmatch '\dist\' } |
+            Where-Object {
+              $_.FullName -notlike '*\.deps\*' -and
+              $_.FullName -notlike '*\obs-install\*' -and
+              $_.FullName -notlike '*\dist\*'
+            } |
             Sort-Object @{ Expression = { if ($_.FullName -match 'RelWithDebInfo|Release') { 0 } else { 1 } } }, FullName |
             Select-Object -First 1
           if ($null -eq $dll) { throw 'Could not locate the compiled sync-guardian.dll.' }
+          Write-Host "Packaging DLL: $($dll.FullName)"
 
           Copy-Item -Force $dll.FullName (Join-Path $pluginDir 'sync-guardian.dll')
           Copy-Item -Force "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" (Join-Path $localeDir 'en-US.ini')
