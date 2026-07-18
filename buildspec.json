@@ -30,7 +30,7 @@
   },
   "name": "sync-guardian",
   "displayName": "Sync Guardian",
-  "version": "0.3.4",
+  "version": "0.5.0",
   "author": "Sync Guardian contributors",
   "website": "https://github.com",
   "platformConfig": {

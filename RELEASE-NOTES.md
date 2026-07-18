@@ -1,5 +1,11 @@
-# Sync Guardian v0.3.4
+# Sync Guardian v0.5.0
 
-This hotfix expands Adaptive Soft Sync for controlled fast catch-up. The maximum correction control now permits up to 5000 ppm (0.5%), while remaining at a conservative 50 ppm by default. Existing corrected error uses a smooth nonlinear catch-up curve, and correction brakes toward neutral at twice the selected slew rate to reduce overshoot.
+This release turns the v0.4 monitoring and recovery engine into a streamer-oriented install-and-run experience.
 
-At 5000 ppm, correction can accumulate at up to 300 ms per minute. This high range may be audible on pitch-sensitive material and should be used as a catch-up ceiling rather than a normal steady-state setting.
+On first launch, Sync Guardian proposes likely DistroAV video, desktop-audio, and microphone assignments. The main card shows the detected mapping and asks for one confirmation; no automatic correction or recovery is permitted before that confirmation. Automatic Protection then enables gradual Drift Controller correction and guarded targeted recovery behind one switch.
+
+Normal healthy callback gaps are learned and used to raise effective stall thresholds when necessary, reducing false recoveries caused by routine OBS scheduling jitter. The learned threshold numbers remain visible in Protection settings. If desktop audio and microphone appear to originate from the same sender identity, linked correction is recommended automatically.
+
+The compact dashboard now reports setup/readiness state, corrected offset, measurement reliability, and recent actions. A Protection Test performs a controlled group rebuild, restores captured DistroAV and OBS state, and verifies recovery. Support-report export writes a privacy-conscious JSON report without exposing mapped source names.
+
+All detailed values remain available: raw and filtered offsets, baseline, drift slope, ppm correction, filter validation error, packet ages, timestamp jumps, reset counts, receiver properties, and event history.

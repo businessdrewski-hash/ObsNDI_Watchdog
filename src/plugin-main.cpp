@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Sync Guardian v0.3.3 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
+// Sync Guardian v0.5.0 - hands-free OBS companion for DistroAV/NDI sync protection.
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -59,7 +59,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("sync-guardian", "en-US")
 
 #ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "0.3.3"
+#define PLUGIN_VERSION "0.5.0"
 #endif
 
 namespace {
@@ -91,6 +91,9 @@ constexpr uint64_t kIncidentCooldownNs = 5ULL * 60ULL * kNsPerSecond;
 constexpr uint64_t kResetLimitWindowNs = 60ULL * 60ULL * kNsPerSecond;
 constexpr uint64_t kObserveRepeatNs = 30ULL * kNsPerSecond;
 constexpr uint64_t kJumpEvidenceWindowNs = 5ULL * kNsPerSecond;
+constexpr uint64_t kIncidentQuarantineNs = 8ULL * kNsPerSecond;
+constexpr uint64_t kStableCalibrationMinimumNs = 30ULL * kNsPerSecond;
+constexpr uint64_t kReliableMinimumSpanNs = 10ULL * kNsPerSecond;
 constexpr uint64_t kStallConfirmNs = 500ULL * kNsPerMs;
 constexpr uint64_t kFirstSampleGraceNs = 2ULL * kNsPerSecond;
 constexpr uint64_t kIssueEpisodeMergeNs = 60ULL * kNsPerSecond;
@@ -120,6 +123,13 @@ static double median(std::vector<double> values)
 		result = (*lower + result) * 0.5;
 	}
 	return result;
+}
+
+static void updateAtomicMaximum(std::atomic<uint64_t> &value, uint64_t candidate)
+{
+	uint64_t current = value.load();
+	while (candidate > current && !value.compare_exchange_weak(current, candidate)) {
+	}
 }
 
 static QString driftDirectionShort(double rateMsPerMinute)
@@ -193,8 +203,41 @@ enum class IssueKind : int {
 	VideoStall,
 	DesktopAudioStall,
 	MicStall,
+	VideoJump,
+	DesktopAudioJump,
+	MicJump,
 	PersistentDrift,
 };
+
+enum class MeasurementReliability : int {
+	Waiting = 0,
+	Calibrating,
+	Reliable,
+	Unreliable,
+};
+
+enum class MonitorState : int {
+	Stable = 0,
+	Drifting,
+	JumpSuspected,
+	Recovering,
+	Verifying,
+	Failed,
+};
+
+static QString reliabilityName(MeasurementReliability reliability)
+{
+	switch (reliability) {
+	case MeasurementReliability::Calibrating:
+		return QStringLiteral("Calibrating");
+	case MeasurementReliability::Reliable:
+		return QStringLiteral("Reliable");
+	case MeasurementReliability::Unreliable:
+		return QStringLiteral("Unreliable");
+	default:
+		return QStringLiteral("Waiting");
+	}
+}
 
 static QString targetName(RecoveryTarget target)
 {
@@ -239,6 +282,12 @@ static QString issueSummaryName(IssueKind issue)
 		return QStringLiteral("NDI desktop audio stalled");
 	case IssueKind::MicStall:
 		return QStringLiteral("NDI microphone stalled");
+	case IssueKind::VideoJump:
+		return QStringLiteral("NDI video timestamp jumped");
+	case IssueKind::DesktopAudioJump:
+		return QStringLiteral("NDI desktop-audio timestamp jumped");
+	case IssueKind::MicJump:
+		return QStringLiteral("NDI microphone timestamp jumped");
 	case IssueKind::PersistentDrift:
 		return QStringLiteral("persistent A/V timestamp drift detected");
 	default:
@@ -616,6 +665,7 @@ struct SourceState {
 	std::atomic<int64_t> lastVideoJumpErrorNs{0};
 	std::atomic<uint64_t> videoJumpCount{0};
 	std::atomic<uint64_t> firstValidSampleWallNs{0};
+	std::atomic<uint64_t> observedHealthyGapNs{0};
 	obs_weak_source_t *videoProbeWeak = nullptr;
 	uint64_t videoProbeToken = 0;
 	obs_weak_source_t *softSyncFilterWeak = nullptr;
@@ -692,8 +742,11 @@ static obs_source_frame *videoProbeFilter(void *data, obs_source_frame *frame)
 	const int64_t timestampDelta = signedDelta(timestamp, previousTimestamp);
 	const int64_t wallDelta = signedDelta(now, previousWall);
 	const int64_t error = timestampDelta - wallDelta;
-	if (std::llabs(error) < static_cast<int64_t>(kJumpThresholdNs))
+	if (std::llabs(error) < static_cast<int64_t>(kJumpThresholdNs)) {
+		if (wallDelta > 0 && wallDelta <= static_cast<int64_t>(500ULL * kNsPerMs))
+			updateAtomicMaximum(state->observedHealthyGapNs, static_cast<uint64_t>(wallDelta));
 		return frame;
+	}
 
 	const uint64_t previousJump = state->lastVideoJumpWallNs.load();
 	if (previousJump && now - previousJump < kJumpCooldownNs)
@@ -817,6 +870,7 @@ struct EngineSettings {
 	std::atomic_bool enableFreezeDetection{true};
 	std::atomic_bool enableDriftDetection{true};
 	std::atomic_bool autoEscalate{true};
+	std::atomic_bool autoTuneThresholds{true};
 	std::atomic<int> videoStallMs{1000};
 	std::atomic<int> audioStallMs{1000};
 	std::atomic<int> driftThresholdMs{200};
@@ -846,6 +900,7 @@ public:
 		states_[2].monitorAudio = true;
 
 		buildUi();
+		validateParameterBindings();
 		refreshSourceLists();
 		loadConfiguration();
 		bindAllSources();
@@ -918,6 +973,14 @@ private:
 	QSpinBox *softSyncSlewPpmPerSec_ = nullptr;
 
 	QComboBox *automationMode_ = nullptr;
+	QCheckBox *automaticProtection_ = nullptr;
+	QCheckBox *autoTuneThresholds_ = nullptr;
+	QLabel *readinessLabel_ = nullptr;
+	QLabel *notificationLabel_ = nullptr;
+	QLabel *effectiveThresholdsLabel_ = nullptr;
+	QPushButton *confirmSetupButton_ = nullptr;
+	QPushButton *protectionTestButton_ = nullptr;
+	QPushButton *exportReportButton_ = nullptr;
 	QPushButton *advancedToggleButton_ = nullptr;
 	QWidget *advancedSettingsWidget_ = nullptr;
 	QCheckBox *onlyWhenOutputActive_ = nullptr;
@@ -939,6 +1002,9 @@ private:
 	QPushButton *resetBothAudioButton_ = nullptr;
 	QPushButton *rebuildGroupButton_ = nullptr;
 	QLabel *manualSuggestionLabel_ = nullptr;
+	QLabel *compactStatusLabel_ = nullptr;
+	QLabel *compactOffsetLabel_ = nullptr;
+	QPushButton *fixNowButton_ = nullptr;
 
 	QLabel *automationStatusLabel_ = nullptr;
 	QLabel *overallSummaryLabel_ = nullptr;
@@ -980,6 +1046,15 @@ private:
 	std::atomic<double> driftRateMsPerMinute_{std::numeric_limits<double>::quiet_NaN()};
 	std::atomic<double> controllerRateMsPerMinute_{std::numeric_limits<double>::quiet_NaN()};
 	std::atomic<double> softSyncEstimatedDriftMs_{std::numeric_limits<double>::quiet_NaN()};
+	std::atomic<int> measurementReliability_{static_cast<int>(MeasurementReliability::Waiting)};
+	std::atomic<int> monitorState_{static_cast<int>(MonitorState::Stable)};
+	std::atomic<uint64_t> quarantineUntilNs_{0};
+	std::atomic<uint64_t> lastAcceptedSampleNs_{0};
+	std::atomic<uint32_t> consecutiveRecoveryFailures_{0};
+	std::atomic_bool setupConfirmedAtomic_{false};
+	std::atomic<double> softSyncValidationErrorMs_{std::numeric_limits<double>::quiet_NaN()};
+	std::atomic_bool driftControllerSaturated_{false};
+	std::atomic<uint32_t> softSyncValidationFailures_{0};
 	std::atomic<uint64_t> monitoringGraceUntilAtomicNs_{0};
 	std::atomic_bool outputActiveAtomic_{false};
 	std::atomic<uint64_t> snapshotRebuildAtNs_{0};
@@ -999,11 +1074,15 @@ private:
 	uint64_t driftSinceNs_ = 0;
 	uint64_t lastObservedIssueNs_ = 0;
 	uint64_t lastIncidentStartNs_ = 0;
+	uint64_t lastLifecycleScanNs_ = 0;
+	uint64_t notificationHideAtNs_ = 0;
+	bool setupConfirmed_ = false;
+	bool firstRun_ = false;
 	QString lastObservedIssueKey_;
 	RecoveryTarget suggestedTarget_ = RecoveryTarget::None;
 	int currentConfidence_ = 0;
 	std::array<uint64_t, 3> loggedJumpCounts_{0, 0, 0};
-	std::array<uint64_t, 7> issueEpisodeCounts_{0, 0, 0, 0, 0, 0, 0};
+	std::array<uint64_t, 10> issueEpisodeCounts_{};
 	IssueKind activeSummaryIssue_ = IssueKind::None;
 	IssueKind lastCountedIssue_ = IssueKind::None;
 	uint64_t lastCountedIssueNs_ = 0;
@@ -1024,6 +1103,7 @@ private:
 	std::deque<uint64_t> engineResetTimes_;
 	RecoveryAttempt backgroundRecovery_;
 	uint64_t lastSoftSyncControllerNs_ = 0;
+	bool softSyncControllerPaused_ = false;
 
 	std::array<obs_hotkey_id, 8> hotkeys_{OBS_INVALID_HOTKEY_ID, OBS_INVALID_HOTKEY_ID,
 					      OBS_INVALID_HOTKEY_ID, OBS_INVALID_HOTKEY_ID,
@@ -1048,23 +1128,26 @@ private:
 		headerWidget->setMinimumHeight(24);
 		headerWidget->setMaximumHeight(26);
 		auto *header = new QHBoxLayout(headerWidget);
-		header->setContentsMargins(6, 0, 4, 0);
-		header->setSpacing(3);
-
-		auto *titleLabel = new QLabel(title, headerWidget);
-		titleLabel->setProperty("collapsibleTitle", true);
-		titleLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-		header->addWidget(titleLabel, 1);
+		header->setContentsMargins(3, 0, 4, 0);
+		header->setSpacing(2);
 
 		auto *toggle = new QToolButton(headerWidget);
+		toggle->setObjectName(QStringLiteral("SyncGuardianSectionToggle"));
 		toggle->setCheckable(true);
 		toggle->setChecked(expanded);
 		toggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
 		toggle->setToolButtonStyle(Qt::ToolButtonIconOnly);
 		toggle->setAutoRaise(true);
-		toggle->setFixedSize(22, 22);
+		toggle->setFixedSize(18, 18);
+		toggle->setFocusPolicy(Qt::NoFocus);
 		toggle->setToolTip(QStringLiteral("Show or hide this section."));
-		header->addWidget(toggle, 0, Qt::AlignRight | Qt::AlignVCenter);
+		header->addWidget(toggle, 0, Qt::AlignLeft | Qt::AlignVCenter);
+
+		auto *titleLabel = new QLabel(title, headerWidget);
+		titleLabel->setProperty("collapsibleTitle", true);
+		titleLabel->setMinimumWidth(0);
+		titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+		header->addWidget(titleLabel, 1, Qt::AlignVCenter);
 		sectionLayout->addWidget(headerWidget);
 
 		content = new QWidget(section);
@@ -1132,8 +1215,48 @@ private:
 		root->setSpacing(3);
 		root->setSizeConstraint(QLayout::SetMinAndMaxSize);
 
+		auto *dashboard = new QWidget(scrollContent);
+		dashboard->setObjectName(QStringLiteral("SyncGuardianDashboard"));
+		auto *dashboardLayout = new QGridLayout(dashboard);
+		dashboardLayout->setContentsMargins(6, 5, 6, 5);
+		dashboardLayout->setHorizontalSpacing(5);
+		dashboardLayout->setVerticalSpacing(2);
+		compactStatusLabel_ = new QLabel(QStringLiteral("Starting"), dashboard);
+		compactStatusLabel_->setStyleSheet(QStringLiteral("font-weight: 700; font-size: 13px;"));
+		compactOffsetLabel_ = new QLabel(QStringLiteral("Corrected offset: —"), dashboard);
+		compactOffsetLabel_->setWordWrap(true);
+		readinessLabel_ = new QLabel(QStringLiteral("Checking protection readiness…"), dashboard);
+		readinessLabel_->setWordWrap(true);
+		notificationLabel_ = new QLabel(dashboard);
+		notificationLabel_->setWordWrap(true);
+		notificationLabel_->setVisible(false);
+		automaticProtection_ = new QCheckBox(QStringLiteral("Automatic Protection"), dashboard);
+		automaticProtection_->setChecked(true);
+		automaticProtection_->setToolTip(QStringLiteral("Automatically corrects slow drift and performs guarded targeted recovery for confirmed jumps or stalls."));
+		automationMode_ = new QComboBox(dashboard);
+		automationMode_->addItem(QStringLiteral("Monitor"), static_cast<int>(AutomationMode::Observe));
+		automationMode_->addItem(QStringLiteral("Ask"), static_cast<int>(AutomationMode::Ask));
+		automationMode_->addItem(QStringLiteral("Auto"), static_cast<int>(AutomationMode::Automatic));
+		automationMode_->setToolTip(QStringLiteral("Monitor reports only. Ask requests confirmation. Auto performs guarded jump recovery."));
+		fixNowButton_ = new QPushButton(QStringLiteral("Fix now"), dashboard);
+		fixNowButton_->setEnabled(false);
+		fixNowButton_->setToolTip(QStringLiteral("Runs the smallest recovery currently recommended by Sync Guardian."));
+		confirmSetupButton_ = new QPushButton(QStringLiteral("Confirm detected setup"), dashboard);
+		dashboardLayout->addWidget(compactStatusLabel_, 0, 0, 1, 2);
+		dashboardLayout->addWidget(compactOffsetLabel_, 1, 0, 1, 2);
+		dashboardLayout->addWidget(readinessLabel_, 2, 0, 1, 2);
+		dashboardLayout->addWidget(automaticProtection_, 3, 0);
+		dashboardLayout->addWidget(fixNowButton_, 3, 1);
+		dashboardLayout->addWidget(confirmSetupButton_, 4, 0, 1, 2);
+		dashboardLayout->addWidget(notificationLabel_, 5, 0, 1, 2);
+		root->addWidget(dashboard);
+		QObject::connect(fixNowButton_, &QPushButton::clicked, [this]() {
+			if (suggestedTarget_ != RecoveryTarget::None)
+				manualReset(suggestedTarget_, QStringLiteral("Contextual Fix now"));
+		});
+
 		QWidget *sourceContent = nullptr;
-		auto *sourceBox = createCollapsibleSection(QStringLiteral("NDI source mapping"), scrollContent, sourceContent);
+		auto *sourceBox = createCollapsibleSection(QStringLiteral("Sources"), scrollContent, sourceContent, false);
 		auto *sourceForm = new QFormLayout(sourceContent);
 		sourceForm->setContentsMargins(0, 0, 0, 0);
 		sourceForm->setHorizontalSpacing(6);
@@ -1152,32 +1275,57 @@ private:
 			QObject::connect(sourceCombos_[i], QOverload<int>::of(&QComboBox::currentIndexChanged),
 					 [this, i](int) {
 						bindSource(i, sourceCombos_[i]->currentData().toString());
+						setupConfirmed_ = false;
+						setupConfirmedAtomic_.store(false);
 						clearCalibration(QStringLiteral("source mapping changed"), false);
 						saveConfig();
 					 });
 		}
+		auto *sourceActions = new QWidget(sourceContent);
+		auto *sourceActionsLayout = new QHBoxLayout(sourceActions);
+		sourceActionsLayout->setContentsMargins(0, 0, 0, 0);
+		auto *detectSourcesButton = new QPushButton(QStringLiteral("Detect sources"), sourceActions);
+		sourceActionsLayout->addWidget(detectSourcesButton);
+		sourceForm->addRow(sourceActions);
+		QObject::connect(detectSourcesButton, &QPushButton::clicked, [this]() { suggestSourceMappings(true); });
+		QObject::connect(confirmSetupButton_, &QPushButton::clicked, [this]() {
+			setupConfirmed_ = true;
+			setupConfirmedAtomic_.store(true);
+			saveConfig();
+			showNotification(QStringLiteral("Setup confirmed. Protection will enable after timing becomes reliable."), false);
+		});
 		root->addWidget(sourceBox);
 
 		QWidget *automationContent = nullptr;
-		auto *automationBox = createCollapsibleSection(QStringLiteral("Automatic detection and recovery"), scrollContent, automationContent);
+		auto *automationBox = createCollapsibleSection(QStringLiteral("Protection settings"), scrollContent, automationContent, false);
 		auto *automationForm = new QFormLayout(automationContent);
 		automationForm->setContentsMargins(0, 0, 0, 0);
 		automationForm->setHorizontalSpacing(6);
 		automationForm->setVerticalSpacing(3);
-		automationMode_ = new QComboBox(automationContent);
-		automationMode_->addItem(QStringLiteral("Observe only"), static_cast<int>(AutomationMode::Observe));
-		automationMode_->addItem(QStringLiteral("Ask before resetting"), static_cast<int>(AutomationMode::Ask));
-		automationMode_->addItem(QStringLiteral("Fully automatic"), static_cast<int>(AutomationMode::Automatic));
-		automationMode_->setToolTip(QStringLiteral(
-			"Observe only is safest. Ask mode offers a confirmation prompt. Fully automatic performs the highlighted recovery after all safeguards pass."));
-		automationForm->addRow(QStringLiteral("Operating mode:"), automationMode_);
-
 		auto *simpleHelp = new QLabel(QStringLiteral(
-			"Recommended: begin with Observe only. Sync Guardian waits for real video and audio timestamps before judging sync."),
+			"Automatic Protection corrects slow drift and performs guarded recovery for confirmed timestamp jumps or stalls."),
 			automationContent);
 		simpleHelp->setWordWrap(true);
 		simpleHelp->setStyleSheet(QStringLiteral("color: #c7ced8;"));
 		automationForm->addRow(simpleHelp);
+		automationForm->addRow(QStringLiteral("Detailed protection mode:"), automationMode_);
+		autoTuneThresholds_ = new QCheckBox(QStringLiteral("Automatically tune stall thresholds"), automationContent);
+		autoTuneThresholds_->setChecked(true);
+		autoTuneThresholds_->setToolTip(QStringLiteral("Learns healthy callback gaps and raises stall thresholds enough to ignore routine scheduling jitter."));
+		automationForm->addRow(autoTuneThresholds_);
+		effectiveThresholdsLabel_ = new QLabel(QStringLiteral("Effective thresholds: learning"), automationContent);
+		effectiveThresholdsLabel_->setWordWrap(true);
+		automationForm->addRow(effectiveThresholdsLabel_);
+		auto *qolActions = new QWidget(automationContent);
+		auto *qolActionsLayout = new QHBoxLayout(qolActions);
+		qolActionsLayout->setContentsMargins(0, 0, 0, 0);
+		protectionTestButton_ = new QPushButton(QStringLiteral("Test protection"), qolActions);
+		exportReportButton_ = new QPushButton(QStringLiteral("Export support report"), qolActions);
+		qolActionsLayout->addWidget(protectionTestButton_);
+		qolActionsLayout->addWidget(exportReportButton_);
+		automationForm->addRow(qolActions);
+		QObject::connect(protectionTestButton_, &QPushButton::clicked, [this]() { runProtectionTest(); });
+		QObject::connect(exportReportButton_, &QPushButton::clicked, [this]() { exportSupportReport(); });
 
 		advancedToggleButton_ = new QPushButton(QStringLiteral("Show advanced detection settings"), automationContent);
 		advancedToggleButton_->setCheckable(true);
@@ -1260,7 +1408,7 @@ private:
 		root->addWidget(automationBox);
 
 		QWidget *softSyncContent = nullptr;
-		auto *softSyncBox = createCollapsibleSection(QStringLiteral("Experimental adaptive audio sync"), scrollContent, softSyncContent);
+		auto *softSyncBox = createCollapsibleSection(QStringLiteral("Drift Controller"), scrollContent, softSyncContent, false);
 		auto *softSyncForm = new QFormLayout(softSyncContent);
 		softSyncForm->setContentsMargins(0, 0, 0, 0);
 		softSyncForm->setHorizontalSpacing(6);
@@ -1314,7 +1462,7 @@ private:
 		});
 
 		QWidget *controlContent = nullptr;
-		auto *controlBox = createCollapsibleSection(QStringLiteral("Manual recovery"), scrollContent, controlContent);
+		auto *controlBox = createCollapsibleSection(QStringLiteral("Manual recovery"), scrollContent, controlContent, false);
 		auto *controlGrid = new QGridLayout(controlContent);
 		controlGrid->setContentsMargins(0, 0, 0, 0);
 		controlGrid->setHorizontalSpacing(4);
@@ -1411,8 +1559,8 @@ private:
 		});
 
 		QWidget *diagnosticsContent = nullptr;
-		auto *diagnosticsBox = createCollapsibleSection(QStringLiteral("Live diagnostics"), scrollContent,
-								 diagnosticsContent);
+		auto *diagnosticsBox = createCollapsibleSection(QStringLiteral("Numbers and diagnostics"), scrollContent,
+								 diagnosticsContent, false);
 		auto *diagnosticsLayout = new QVBoxLayout(diagnosticsContent);
 		diagnosticsLayout->setContentsMargins(0, 0, 0, 0);
 		diagnosticsLayout->setSpacing(3);
@@ -1442,7 +1590,7 @@ private:
 		detailsLayout->setContentsMargins(0, 1, 0, 0);
 		detailsLayout->setSpacing(2);
 		automationStatusLabel_ = new QLabel(QStringLiteral("Automation: starting"), diagnosticDetailsWidget_);
-		healthLabel_ = new QLabel(QStringLiteral("Detection confidence: 0/100"), diagnosticDetailsWidget_);
+		healthLabel_ = new QLabel(QStringLiteral("Measurement: Waiting"), diagnosticDetailsWidget_);
 		avOffsetLabel_ = new QLabel(QStringLiteral("Video − Desktop Audio timestamp: —"), diagnosticDetailsWidget_);
 		micOffsetLabel_ = new QLabel(QStringLiteral("Mic − Desktop Audio timestamp: —"), diagnosticDetailsWidget_);
 		obsStatsLabel_ = new QLabel(QStringLiteral("OBS: —"), diagnosticDetailsWidget_);
@@ -1510,6 +1658,265 @@ private:
 		return spin;
 	}
 
+	void validateParameterBindings() const
+	{
+		const std::array<const QWidget *, 35> required = {
+			panel_, automationMode_, advancedToggleButton_, advancedSettingsWidget_, onlyWhenOutputActive_,
+			requireActiveSources_, enableFreezeDetection_, enableDriftDetection_, autoEscalate_, videoStallMs_,
+			audioStallMs_, driftThresholdMs_, driftPersistenceMs_, cooldownSec_, maxAutoResetsPerHour_,
+			startupGraceSec_, verifyDelaySec_, pulseDurationMs_, enableSoftSync_, softSyncLinkMic_,
+			softSyncDeadZoneMs_, softSyncMaxPpm_, softSyncSlewPpmPerSec_, chapterMarkers_, jsonLogging_,
+			incidentReports_, fixNowButton_, automaticProtection_, autoTuneThresholds_, readinessLabel_,
+			notificationLabel_, effectiveThresholdsLabel_, confirmSetupButton_, protectionTestButton_, exportReportButton_};
+		for (const QWidget *widget : required) {
+			if (!widget) {
+				blog(LOG_ERROR, "[sync-guardian] v0.5 parameter audit failed: a required UI/runtime binding is null");
+				return;
+			}
+		}
+		const bool rangesValid = videoStallMs_->minimum() <= videoStallMs_->value() &&
+			videoStallMs_->value() <= videoStallMs_->maximum() &&
+			audioStallMs_->minimum() <= audioStallMs_->value() && audioStallMs_->value() <= audioStallMs_->maximum() &&
+			softSyncMaxPpm_->minimum() <= softSyncMaxPpm_->value() && softSyncMaxPpm_->value() <= softSyncMaxPpm_->maximum();
+		blog(rangesValid ? LOG_INFO : LOG_ERROR,
+		     rangesValid ? "[sync-guardian] v0.5 parameter audit passed: visible controls have runtime bindings and valid ranges"
+				 : "[sync-guardian] v0.5 parameter audit failed: one or more defaults are outside their control range");
+	}
+
+	void showNotification(const QString &message, bool warning)
+	{
+		if (!notificationLabel_)
+			return;
+		notificationLabel_->setText(message);
+		notificationLabel_->setStyleSheet(warning
+			? QStringLiteral("color: #ffb4a9; font-weight: 600;")
+			: QStringLiteral("color: #8bd49c; font-weight: 600;"));
+		notificationLabel_->setVisible(true);
+		notificationHideAtNs_ = os_gettime_ns() + 10ULL * kNsPerSecond;
+	}
+
+	void queueUserNotification(const QString &message, bool warning)
+	{
+		QMetaObject::invokeMethod(lifetimeContext_, [this, message, warning]() {
+			showNotification(message, warning);
+		}, Qt::QueuedConnection);
+	}
+
+	int effectiveStallThresholdMs(size_t index) const
+	{
+		const int configured = index == 0 ? engineSettings_.videoStallMs.load() : engineSettings_.audioStallMs.load();
+		if (!engineSettings_.autoTuneThresholds.load())
+			return configured;
+		const uint64_t gapNs = states_[index].observedHealthyGapNs.load();
+		if (!gapNs)
+			return configured;
+		const int learned = static_cast<int>(gapNs / kNsPerMs) * 4 + 250;
+		return std::clamp(std::max(configured, learned), 250, 10000);
+	}
+
+	QString senderHostForSource(const QString &sourceName) const
+	{
+		obs_source_t *source = obs_get_source_by_name(sourceName.toUtf8().constData());
+		if (!source)
+			return QString();
+		obs_data_t *settings = obs_source_get_settings(source);
+		QString target = QString::fromUtf8(obs_data_get_string(settings, kPropSource)).trimmed();
+		obs_data_release(settings);
+		obs_source_release(source);
+		int split = target.indexOf(QStringLiteral(" ("));
+		if (split < 0)
+			split = target.indexOf(QLatin1Char('('));
+		return (split > 0 ? target.left(split) : target).trimmed().toLower();
+	}
+
+	void suggestSourceMappings(bool userRequested)
+	{
+		std::vector<QString> videoCandidates;
+		std::vector<QString> audioCandidates;
+		std::vector<QString> micCandidates;
+		for (int row = 1; row < sourceCombos_[0]->count(); ++row) {
+			const QString name = sourceCombos_[0]->itemData(row).toString();
+			if (name.isEmpty())
+				continue;
+			obs_source_t *source = obs_get_source_by_name(name.toUtf8().constData());
+			if (!source)
+				continue;
+			const uint32_t flags = obs_source_get_output_flags(source);
+			obs_source_release(source);
+			const QString lower = name.toLower();
+			if (flags & OBS_SOURCE_VIDEO)
+				videoCandidates.push_back(name);
+			if (flags & OBS_SOURCE_AUDIO)
+				audioCandidates.push_back(name);
+			if (lower.contains(QStringLiteral("mic")) || lower.contains(QStringLiteral("microphone")))
+				micCandidates.push_back(name);
+		}
+
+		auto firstMatching = [](const std::vector<QString> &items, std::initializer_list<const char *> terms,
+					     const QString &exclude = QString()) {
+			for (const QString &item : items) {
+				if (item == exclude)
+					continue;
+				const QString lower = item.toLower();
+				for (const char *term : terms) {
+					if (lower.contains(QString::fromUtf8(term)))
+						return item;
+				}
+			}
+			for (const QString &item : items)
+				if (item != exclude)
+					return item;
+			return QString();
+		};
+
+		const QString video = firstMatching(videoCandidates, {"video", "ndi", "game"});
+		const QString mic = firstMatching(micCandidates, {"mic", "microphone"});
+		std::vector<QString> desktopCandidates;
+		for (const QString &candidate : audioCandidates) {
+			if (candidate != mic)
+				desktopCandidates.push_back(candidate);
+		}
+		QString desktop = firstMatching(desktopCandidates, {"desktop", "game", "system", "audio"});
+		if (desktop == video && desktopCandidates.size() > 1)
+			desktop = firstMatching(desktopCandidates, {"desktop", "audio", "game"}, video);
+
+		auto applySuggestion = [this](size_t index, const QString &name) {
+			if (name.isEmpty())
+				return;
+			const int comboIndex = sourceCombos_[index]->findData(name);
+			if (comboIndex < 0)
+				return;
+			{
+				QSignalBlocker blocker(sourceCombos_[index]);
+				sourceCombos_[index]->setCurrentIndex(comboIndex);
+			}
+			bindSource(index, name);
+		};
+		applySuggestion(0, video);
+		applySuggestion(1, desktop);
+		applySuggestion(2, mic);
+		setupConfirmed_ = false;
+		setupConfirmedAtomic_.store(false);
+
+		const QString desktopHost = senderHostForSource(desktop);
+		const QString micHost = senderHostForSource(mic);
+		const bool micLinkedSuggestion = !desktopHost.isEmpty() && desktopHost == micHost;
+		if (micLinkedSuggestion) {
+			QSignalBlocker blocker(softSyncLinkMic_);
+			softSyncLinkMic_->setChecked(true);
+		}
+		updateEngineSettings();
+		syncSoftSyncFilters();
+		saveConfig();
+		showNotification(video.isEmpty() || desktop.isEmpty()
+			? QStringLiteral("Source detection needs help: select video and desktop audio, then confirm setup.")
+			: QStringLiteral("Sources detected%1. Check the assignments once, then confirm setup.")
+				.arg(micLinkedSuggestion ? QStringLiteral("; mic appears to share the sender clock and was linked") : QString()),
+			video.isEmpty() || desktop.isEmpty());
+		if (userRequested)
+			appendEvent(QStringLiteral("Automatic source-role detection completed"), false);
+	}
+
+	void runProtectionTest()
+	{
+		if (!setupConfirmed_) {
+			showNotification(QStringLiteral("Confirm the source assignments before testing protection."), true);
+			return;
+		}
+		if (recovery_.active || backgroundRecovery_.active || anyResetInProgress()) {
+			showNotification(QStringLiteral("Protection test is waiting for the current recovery to finish."), true);
+			return;
+		}
+		if (!sourceMapped(0) || !sourceMapped(1)) {
+			showNotification(QStringLiteral("Protection test needs mapped video and desktop-audio sources."), true);
+			return;
+		}
+		if (outputActive()) {
+			const auto choice = QMessageBox::warning(panel_, QStringLiteral("Run protection test during output?"),
+				QStringLiteral("Streaming or recording is active. The test briefly rebuilds the mapped DistroAV receivers. Run it anyway?"),
+				QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+			if (choice != QMessageBox::Yes)
+				return;
+		}
+		captureSnapshotState();
+		if (!resetTarget(RecoveryTarget::EntireGroup)) {
+			showNotification(QStringLiteral("Protection test could not safely rebuild the mapped receivers."), true);
+			return;
+		}
+		const uint64_t now = os_gettime_ns();
+		recovery_.active = true;
+		recovery_.target = RecoveryTarget::EntireGroup;
+		recovery_.issue = IssueKind::None;
+		recovery_.reason = QStringLiteral("user-requested protection self-test");
+		recovery_.verifyAtNs = now + static_cast<uint64_t>(engineSettings_.pulseDurationMs.load()) * kNsPerMs +
+			static_cast<uint64_t>(engineSettings_.verifyDelaySec.load()) * kNsPerSecond;
+		quarantineUntilNs_.store(recovery_.verifyAtNs + kIncidentQuarantineNs);
+		showNotification(QStringLiteral("Protection test running; receiver settings will be restored and verified automatically."), false);
+		appendEvent(QStringLiteral("Protection self-test started"), false);
+	}
+
+	void exportSupportReport()
+	{
+		QJsonObject report;
+		report.insert(QStringLiteral("plugin_version"), QStringLiteral(PLUGIN_VERSION));
+		report.insert(QStringLiteral("created"), QDateTime::currentDateTime().toString(Qt::ISODate));
+		report.insert(QStringLiteral("automatic_protection"), automaticProtection_->isChecked());
+		report.insert(QStringLiteral("setup_confirmed"), setupConfirmed_);
+		report.insert(QStringLiteral("measurement"), reliabilityName(static_cast<MeasurementReliability>(measurementReliability_.load())));
+		report.insert(QStringLiteral("raw_offset_ms"), rawOffsetMs_.load());
+		report.insert(QStringLiteral("filtered_offset_ms"), filteredOffsetMs_.load());
+		report.insert(QStringLiteral("baseline_offset_ms"), baselineOffsetMs_.load());
+		report.insert(QStringLiteral("drift_rate_ms_per_min"), driftRateMsPerMinute_.load());
+		report.insert(QStringLiteral("controller_ppm"), states_[1].softSync.correctionPpm.load());
+		report.insert(QStringLiteral("video_threshold_ms"), effectiveStallThresholdMs(0));
+		report.insert(QStringLiteral("audio_threshold_ms"), effectiveStallThresholdMs(1));
+		report.insert(QStringLiteral("event_history"), eventLog_ ? eventLog_->toPlainText() : QString());
+		QJsonArray measurements;
+		for (const auto &sample : diagnosticHistory_) {
+			QJsonObject point;
+			point.insert(QStringLiteral("time"), sample.time);
+			point.insert(QStringLiteral("raw_offset_ms"), sample.rawOffsetMs);
+			point.insert(QStringLiteral("filtered_offset_ms"), sample.filteredOffsetMs);
+			point.insert(QStringLiteral("corrected_drift_ms"), sample.correctedDriftMs);
+			point.insert(QStringLiteral("rate_ms_per_min"), sample.driftRateMsPerMinute);
+			point.insert(QStringLiteral("video_age_ms"), sample.videoAgeMs);
+			point.insert(QStringLiteral("desktop_age_ms"), sample.desktopAgeMs);
+			point.insert(QStringLiteral("mic_age_ms"), sample.micAgeMs);
+			measurements.append(point);
+		}
+		report.insert(QStringLiteral("recent_measurements"), measurements);
+		QJsonArray sources;
+		for (const auto &state : states_) {
+			QJsonObject source;
+			source.insert(QStringLiteral("role"), state.role);
+			source.insert(QStringLiteral("mapped"), !state.sourceName.isEmpty());
+			source.insert(QStringLiteral("active"), state.active.load());
+			source.insert(QStringLiteral("jump_count"), static_cast<qint64>(state.videoJumpCount.load() + state.audioJumpCount.load()));
+			source.insert(QStringLiteral("reset_count"), static_cast<qint64>(state.resetCount.load()));
+			sources.append(source);
+		}
+		report.insert(QStringLiteral("sources"), sources);
+		char *rawPath = obs_module_config_path(QStringLiteral("sync-guardian-support-%1.json")
+								.arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")))
+								.toUtf8().constData());
+		if (!rawPath) {
+			showNotification(QStringLiteral("Support report could not be created."), true);
+			return;
+		}
+		const QString path = QString::fromUtf8(rawPath);
+		bfree(rawPath);
+		QFile file(path);
+		if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+			showNotification(QStringLiteral("Support report could not be written."), true);
+			return;
+		}
+		file.write(QJsonDocument(report).toJson(QJsonDocument::Indented));
+		file.close();
+		showNotification(QStringLiteral("Support report saved."), false);
+		QMessageBox::information(panel_, QStringLiteral("Sync Guardian support report"),
+					 QStringLiteral("Report saved to:\n%1").arg(path));
+	}
+
 	QPushButton *buttonForTarget(RecoveryTarget target) const
 	{
 		switch (target) {
@@ -1537,6 +1944,8 @@ private:
 				button->setStyleSheet(QString());
 		}
 		suggestedTarget_ = RecoveryTarget::None;
+		if (fixNowButton_)
+			fixNowButton_->setEnabled(false);
 		if (manualSuggestionLabel_) {
 			manualSuggestionLabel_->setStyleSheet(QString());
 			manualSuggestionLabel_->setText(QStringLiteral("Suggested manual action: none — monitoring healthy. Hover over a button for help."));
@@ -1553,6 +1962,11 @@ private:
 		}
 
 		suggestedTarget_ = target;
+		if (fixNowButton_) {
+			fixNowButton_->setEnabled(target != RecoveryTarget::None);
+			fixNowButton_->setText(target == RecoveryTarget::None ? QStringLiteral("Fix now")
+									 : QStringLiteral("Fix %1").arg(targetName(target)));
+		}
 		QPushButton *suggested = buttonForTarget(target);
 		if (suggested) {
 			suggested->setStyleSheet(QStringLiteral(
@@ -1562,11 +1976,10 @@ private:
 		}
 		if (manualSuggestionLabel_) {
 			manualSuggestionLabel_->setStyleSheet(QStringLiteral("font-weight: 600;"));
+			Q_UNUSED(confidence);
 			manualSuggestionLabel_->setText(
-				QStringLiteral("Suggested manual action: %1%2\n%3")
-					.arg(suggested ? suggested->text() : targetName(target))
-					.arg(confidence > 0 ? QStringLiteral(" (%1/100 confidence)").arg(confidence) : QString())
-					.arg(reason));
+				QStringLiteral("Suggested manual action: %1\n%2")
+					.arg(suggested ? suggested->text() : targetName(target), reason));
 		}
 	}
 
@@ -1659,9 +2072,26 @@ private:
 			saveConfig();
 		};
 		QObject::connect(automationMode_, QOverload<int>::of(&QComboBox::currentIndexChanged), [this, save](int) {
+			{
+				QSignalBlocker blocker(automaticProtection_);
+				automaticProtection_->setChecked(currentMode() == AutomationMode::Automatic);
+			}
 			save();
 			appendEvent(QStringLiteral("Automation mode changed to %1").arg(modeName(currentMode())), false);
 		});
+		QObject::connect(automaticProtection_, &QCheckBox::toggled, [this](bool enabled) {
+			setComboDataBlocked(automationMode_, static_cast<int>(enabled ? AutomationMode::Automatic : AutomationMode::Observe));
+			if (enabled) {
+				QSignalBlocker blocker(enableSoftSync_);
+				enableSoftSync_->setChecked(true);
+			}
+			updateEngineSettings();
+			syncSoftSyncFilters();
+			saveConfig();
+			showNotification(enabled ? QStringLiteral("Automatic Protection enabled")
+							 : QStringLiteral("Automatic Protection paused; monitoring remains active"), false);
+		});
+		QObject::connect(autoTuneThresholds_, &QCheckBox::toggled, save);
 		const std::array<QCheckBox *, 8> checks = {onlyWhenOutputActive_, requireActiveSources_,
 							 enableFreezeDetection_, enableDriftDetection_, autoEscalate_,
 							 chapterMarkers_, jsonLogging_, incidentReports_};
@@ -1709,7 +2139,11 @@ private:
 			sourceCombos_[i]->addItem(QStringLiteral("(Not selected)"), QString());
 			for (const QString &name : names)
 				sourceCombos_[i]->addItem(name, name);
-			const int index = sourceCombos_[i]->findData(current);
+			int index = sourceCombos_[i]->findData(current);
+			if (index < 0 && !current.isEmpty()) {
+				sourceCombos_[i]->addItem(QStringLiteral("%1 (missing)").arg(current), current);
+				index = sourceCombos_[i]->count() - 1;
+			}
 			if (index >= 0)
 				sourceCombos_[i]->setCurrentIndex(index);
 		}
@@ -1729,6 +2163,8 @@ private:
 	{
 		loadingConfig_ = true;
 		obs_data_t *config = loadConfig();
+		firstRun_ = config == nullptr;
+		bool migrated = false;
 		const std::array<QString, 3> defaults = {QStringLiteral("NDI Video"), QStringLiteral("NDI Desktop Audio"),
 							  QStringLiteral("NDI MIC only")};
 		const std::array<const char *, 3> sourceKeys = {"video_source", "desktop_source", "mic_source"};
@@ -1746,6 +2182,9 @@ private:
 		}
 
 		if (config) {
+			const long long configVersion = obs_data_has_user_value(config, "config_version")
+				? obs_data_get_int(config, "config_version") : 3;
+			migrated = configVersion < 5;
 			if (obs_data_has_user_value(config, "automation_mode"))
 				setComboDataBlocked(automationMode_, static_cast<int>(obs_data_get_int(config, "automation_mode")));
 			loadCheckIfPresent(config, "only_when_output_active", onlyWhenOutputActive_);
@@ -1758,6 +2197,9 @@ private:
 			loadCheckIfPresent(config, "incident_reports", incidentReports_);
 			loadCheckIfPresent(config, "soft_sync_enabled", enableSoftSync_);
 			loadCheckIfPresent(config, "soft_sync_link_mic", softSyncLinkMic_);
+			loadCheckIfPresent(config, "auto_tune_thresholds", autoTuneThresholds_);
+			setupConfirmed_ = obs_data_has_user_value(config, "setup_confirmed") &&
+				obs_data_get_bool(config, "setup_confirmed");
 			if (obs_data_has_user_value(config, "advanced_settings_visible")) {
 				const bool visible = obs_data_get_bool(config, "advanced_settings_visible");
 				{
@@ -1780,9 +2222,27 @@ private:
 			setSpinBlocked(softSyncDeadZoneMs_, obs_data_get_int(config, "soft_sync_dead_zone_ms"));
 			setSpinBlocked(softSyncMaxPpm_, obs_data_get_int(config, "soft_sync_max_ppm"));
 			setSpinBlocked(softSyncSlewPpmPerSec_, obs_data_get_int(config, "soft_sync_slew_ppm_per_sec"));
+			if (obs_data_has_user_value(config, "baseline_offset_ms"))
+				baselineOffsetMs_.store(obs_data_get_double(config, "baseline_offset_ms"));
 			obs_data_release(config);
 		}
+		if (firstRun_) {
+			setComboDataBlocked(automationMode_, static_cast<int>(AutomationMode::Automatic));
+			setCheckBlocked(automaticProtection_, true);
+			setCheckBlocked(enableSoftSync_, true);
+			setCheckBlocked(autoTuneThresholds_, true);
+			setupConfirmed_ = false;
+		} else {
+			setCheckBlocked(automaticProtection_, currentMode() == AutomationMode::Automatic);
+		}
+		setupConfirmedAtomic_.store(setupConfirmed_);
 		loadingConfig_ = false;
+		if (firstRun_)
+			suggestSourceMappings(false);
+		if (migrated) {
+			saveConfig();
+			appendEvent(QStringLiteral("Migrated Sync Guardian settings to the v0.5 hands-free configuration model"), false);
+		}
 	}
 
 	void setComboDataBlocked(QComboBox *combo, int data)
@@ -1818,6 +2278,7 @@ private:
 		if (!panel_ || loadingConfig_)
 			return;
 		obs_data_t *data = obs_data_create();
+		obs_data_set_int(data, "config_version", 5);
 		obs_data_set_string(data, "video_source", sourceCombos_[0]->currentData().toString().toUtf8().constData());
 		obs_data_set_string(data, "desktop_source", sourceCombos_[1]->currentData().toString().toUtf8().constData());
 		obs_data_set_string(data, "mic_source", sourceCombos_[2]->currentData().toString().toUtf8().constData());
@@ -1832,6 +2293,8 @@ private:
 		obs_data_set_bool(data, "incident_reports", incidentReports_->isChecked());
 		obs_data_set_bool(data, "soft_sync_enabled", enableSoftSync_->isChecked());
 		obs_data_set_bool(data, "soft_sync_link_mic", softSyncLinkMic_->isChecked());
+		obs_data_set_bool(data, "auto_tune_thresholds", autoTuneThresholds_->isChecked());
+		obs_data_set_bool(data, "setup_confirmed", setupConfirmed_);
 		obs_data_set_bool(data, "advanced_settings_visible", advancedToggleButton_->isChecked());
 		obs_data_set_int(data, "video_stall_ms", videoStallMs_->value());
 		obs_data_set_int(data, "audio_stall_ms", audioStallMs_->value());
@@ -1845,6 +2308,8 @@ private:
 		obs_data_set_int(data, "soft_sync_dead_zone_ms", softSyncDeadZoneMs_->value());
 		obs_data_set_int(data, "soft_sync_max_ppm", softSyncMaxPpm_->value());
 		obs_data_set_int(data, "soft_sync_slew_ppm_per_sec", softSyncSlewPpmPerSec_->value());
+		if (std::isfinite(baselineOffsetMs_.load()))
+			obs_data_set_double(data, "baseline_offset_ms", baselineOffsetMs_.load());
 		char *path = obs_module_config_path("sync-guardian.json");
 		if (path) {
 			obs_data_save_json_safe(data, path, ".tmp", ".bak");
@@ -1869,6 +2334,7 @@ private:
 		engineSettings_.enableFreezeDetection.store(enableFreezeDetection_->isChecked());
 		engineSettings_.enableDriftDetection.store(enableDriftDetection_->isChecked());
 		engineSettings_.autoEscalate.store(autoEscalate_->isChecked());
+		engineSettings_.autoTuneThresholds.store(autoTuneThresholds_->isChecked());
 		engineSettings_.videoStallMs.store(videoStallMs_->value());
 		engineSettings_.audioStallMs.store(audioStallMs_->value());
 		engineSettings_.driftThresholdMs.store(driftThresholdMs_->value());
@@ -1983,12 +2449,20 @@ private:
 		const double videoAge = packetAgeMs(0, now);
 		const double desktopAge = packetAgeMs(1, now);
 		const bool fresh = std::isfinite(videoAge) && std::isfinite(desktopAge) &&
-			videoAge < static_cast<double>(engineSettings_.videoStallMs.load()) &&
-			desktopAge < static_cast<double>(engineSettings_.audioStallMs.load());
+			videoAge < static_cast<double>(effectiveStallThresholdMs(0)) &&
+			desktopAge < static_cast<double>(effectiveStallThresholdMs(1));
+
+		const bool jumpEvidence = recentJumpEvidence(now);
+		if (jumpEvidence)
+			quarantineUntilNs_.store(std::max(quarantineUntilNs_.load(), now + kIncidentQuarantineNs));
+		const bool quarantined = now < quarantineUntilNs_.load();
+		const bool resetActive = anyResetInProgress() || backgroundRecovery_.active;
 
 		std::lock_guard<std::mutex> lock(measurementMutex_);
-		if (std::isfinite(raw) && fresh && !anyResetInProgress())
+		if (std::isfinite(raw) && fresh && !resetActive && !quarantined) {
 			offsetSamples_.push_back({now, raw});
+			lastAcceptedSampleNs_.store(now);
+		}
 		while (!offsetSamples_.empty() && now >= offsetSamples_.front().wallNs &&
 		       now - offsetSamples_.front().wallNs > kControllerRateWindowNs)
 			offsetSamples_.pop_front();
@@ -1999,11 +2473,24 @@ private:
 			if (now >= sample.wallNs && now - sample.wallNs <= kOffsetWindowNs)
 				recent.push_back(sample.valueMs);
 		}
-		filteredOffsetMs_.store(median(std::move(recent)));
+		const double filtered = median(recent);
+		filteredOffsetMs_.store(filtered);
 		driftRateMsPerMinute_.store(robustSlopeMsPerMinute(offsetSamples_, now, kRateWindowNs));
 		controllerRateMsPerMinute_.store(robustSlopeMsPerMinute(offsetSamples_, now, kControllerRateWindowNs));
 
-		if (std::isfinite(baselineOffsetMs_.load()) || now < monitoringGraceUntilAtomicNs_.load())
+		MeasurementReliability reliability = MeasurementReliability::Waiting;
+		if (quarantined || resetActive || !fresh || !std::isfinite(raw)) {
+			reliability = MeasurementReliability::Unreliable;
+		} else if (!offsetSamples_.empty()) {
+			const uint64_t span = now >= offsetSamples_.front().wallNs ? now - offsetSamples_.front().wallNs : 0;
+			reliability = span >= kReliableMinimumSpanNs && recent.size() >= 24
+				? MeasurementReliability::Reliable
+				: MeasurementReliability::Calibrating;
+		}
+		measurementReliability_.store(static_cast<int>(reliability));
+
+		if (std::isfinite(baselineOffsetMs_.load()) || now < monitoringGraceUntilAtomicNs_.load() ||
+		    reliability != MeasurementReliability::Reliable || quarantined)
 			return;
 		std::vector<double> baselineValues;
 		uint64_t oldest = now;
@@ -2013,7 +2500,7 @@ private:
 				oldest = std::min(oldest, sample.wallNs);
 			}
 		}
-		if (baselineValues.size() < 80 || now < oldest || now - oldest < kBaselineWindowNs - 2ULL * kNsPerSecond)
+		if (baselineValues.size() < 80 || now < oldest || now - oldest < kStableCalibrationMinimumNs - 2ULL * kNsPerSecond)
 			return;
 		const auto minmax = std::minmax_element(baselineValues.begin(), baselineValues.end());
 		const double range = *minmax.second - *minmax.first;
@@ -2022,7 +2509,7 @@ private:
 			return;
 		const double learned = median(std::move(baselineValues));
 		baselineOffsetMs_.store(learned);
-		queueBackgroundEvent(QStringLiteral("Automatic A/V baseline calibrated at %1 ms after 30 stable seconds")
+		queueBackgroundEvent(QStringLiteral("Automatic A/V baseline calibrated at %1 ms after stable, reliable timing")
 					 .arg(learned, 0, 'f', 2));
 	}
 
@@ -2031,15 +2518,46 @@ private:
 		const bool enabled = engineSettings_.softSyncEnabled.load();
 		SoftSyncControl &desktop = states_[1].softSync;
 		SoftSyncControl &mic = states_[2].softSync;
-		if (!enabled || !desktop.enabled.load()) {
+		const auto reliability = static_cast<MeasurementReliability>(measurementReliability_.load());
+		const uint64_t inputTs = desktop.lastInputTimestampNs.load();
+		const uint64_t outputTs = desktop.lastOutputTimestampNs.load();
+		const uint32_t sampleRate = std::max<uint32_t>(1, desktop.sampleRate.load());
+		if (inputTs && outputTs && desktop.processedBlocks.load() >= 8) {
+			const double observedTrimMs = nsToMs(signedDelta(outputTs, inputTs));
+			const double expectedTrimMs = static_cast<double>(desktop.netFrameAdjustment.load()) * 1000.0 /
+				static_cast<double>(sampleRate);
+			const double validationError = observedTrimMs - expectedTrimMs;
+			softSyncValidationErrorMs_.store(validationError);
+			const uint32_t validationFailures = std::fabs(validationError) > 5.0
+				? softSyncValidationFailures_.load() + 1 : 0;
+			softSyncValidationFailures_.store(validationFailures);
+			if (validationFailures == 8)
+				queueBackgroundEvent(QStringLiteral("Drift Controller paused: output timing did not match the requested correction"));
+		} else {
+			softSyncValidationErrorMs_.store(std::numeric_limits<double>::quiet_NaN());
+			softSyncValidationFailures_ = 0;
+		}
+		const bool incidentPause = now < quarantineUntilNs_.load() || anyResetInProgress() ||
+			backgroundRecovery_.active || reliability != MeasurementReliability::Reliable ||
+			softSyncValidationFailures_.load() >= 8 || !setupConfirmedAtomic_.load();
+		if (!enabled || !desktop.enabled.load() || incidentPause) {
+			driftControllerSaturated_.store(false);
 			desktop.targetPpm.store(0.0);
 			desktop.correctionPpm.store(0.0);
 			mic.targetPpm.store(0.0);
 			mic.correctionPpm.store(0.0);
 			softSyncEstimatedDriftMs_.store(std::numeric_limits<double>::quiet_NaN());
+			if (enabled && desktop.enabled.load() && incidentPause && !softSyncControllerPaused_) {
+				desktop.generation.fetch_add(1);
+				desktop.netFrameAdjustment.store(0);
+				mic.generation.fetch_add(1);
+				mic.netFrameAdjustment.store(0);
+				softSyncControllerPaused_ = true;
+			}
 			lastSoftSyncControllerNs_ = now;
 			return;
 		}
+		softSyncControllerPaused_ = false;
 
 		double dtSeconds = static_cast<double>(kWatchdogSampleIntervalMs) / 1000.0;
 		if (lastSoftSyncControllerNs_ && now > lastSoftSyncControllerNs_)
@@ -2056,8 +2574,8 @@ private:
 		double target = 0.0;
 
 		const bool timingHealthy = std::isfinite(packetAgeMs(0, now)) && std::isfinite(packetAgeMs(1, now)) &&
-			packetAgeMs(0, now) < engineSettings_.videoStallMs.load() &&
-			packetAgeMs(1, now) < engineSettings_.audioStallMs.load() && !anyResetInProgress();
+			packetAgeMs(0, now) < effectiveStallThresholdMs(0) &&
+			packetAgeMs(1, now) < effectiveStallThresholdMs(1) && !anyResetInProgress();
 		if (timingHealthy && std::isfinite(rawDrift) && std::isfinite(longRate)) {
 			// Feed-forward term: a -1.5 ms/min raw drift needs roughly +25 ppm
 			// to stop further separation.
@@ -2078,6 +2596,8 @@ private:
 			}
 		}
 		target = std::clamp(target, -static_cast<double>(maxPpm), static_cast<double>(maxPpm));
+		driftControllerSaturated_.store(std::fabs(target) >= static_cast<double>(maxPpm) * 0.99 &&
+			std::isfinite(estimatedDrift) && std::fabs(estimatedDrift) > engineSettings_.softSyncDeadZoneMs.load());
 		desktop.targetPpm.store(target);
 
 		const double current = desktop.correctionPpm.load();
@@ -2112,11 +2632,20 @@ private:
 			softSyncStatusLabel_->setText(QStringLiteral("Soft Sync: Enabled, waiting for the mapped desktop-audio source/filter"));
 			return;
 		}
+		if (softSyncValidationFailures_.load() >= 8) {
+			softSyncStatusLabel_->setText(QStringLiteral("Drift Controller: paused — correction output validation failed"));
+			return;
+		}
+		if (driftControllerSaturated_.load()) {
+			softSyncStatusLabel_->setText(QStringLiteral("Drift exceeds correction range — controller is at the configured limit"));
+			return;
+		}
 
 		const double ppm = states_[1].softSync.correctionPpm.load();
 		const double rate = controllerRateMsPerMinute_.load();
 		const double delay = softSyncAccumulatedDelayMs();
 		const double estimated = softSyncEstimatedDriftMs_.load();
+		const double validationError = softSyncValidationErrorMs_.load();
 		QString action;
 		if (!std::isfinite(rate))
 			action = QStringLiteral("learning trend");
@@ -2130,12 +2659,14 @@ private:
 			? QStringLiteral(" · corrected drift %1 ms").arg(estimated, 0, 'f', 1)
 			: QString();
 		softSyncStatusLabel_->setText(
-			QStringLiteral("Soft Sync: %1 · %2 ppm · trim %3 ms%4%5")
+			QStringLiteral("Drift Controller: %1 · %2 ppm · trim %3 ms%4%5%6")
 				.arg(action)
 				.arg(ppm, 0, 'f', 1)
 				.arg(delay, 0, 'f', 1)
 				.arg(correctedText)
-				.arg(engineSettings_.softSyncLinkMic.load() ? QStringLiteral(" · mic linked") : QString()));
+				.arg(engineSettings_.softSyncLinkMic.load() ? QStringLiteral(" · mic linked") : QString())
+				.arg(std::isfinite(validationError) ? QStringLiteral(" · verified ±%1 ms").arg(std::fabs(validationError), 0, 'f', 1)
+												 : QStringLiteral(" · validation settling")));
 	}
 
 	static void updateEngineConditionTimer(bool condition, uint64_t &since, uint64_t now)
@@ -2164,21 +2695,24 @@ private:
 		const double desktopAge = packetAgeMs(1, now);
 		const double micAge = packetAgeMs(2, now);
 		const bool videoFresh = std::isfinite(videoAge) &&
-			videoAge < engineSettings_.videoStallMs.load() * 0.75;
+			videoAge < effectiveStallThresholdMs(0) * 0.75;
 		const bool desktopFresh = std::isfinite(desktopAge) &&
-			desktopAge < engineSettings_.audioStallMs.load() * 0.75;
+			desktopAge < effectiveStallThresholdMs(1) * 0.75;
 		const bool micFresh = std::isfinite(micAge) &&
-			micAge < engineSettings_.audioStallMs.load() * 0.75;
+			micAge < effectiveStallThresholdMs(2) * 0.75;
 		switch (backgroundRecovery_.issue) {
 		case IssueKind::EntireGroupStall:
 			return videoFresh && desktopFresh && (!sourceMapped(2) || micFresh);
 		case IssueKind::BothAudioStall:
 			return desktopFresh && micFresh;
 		case IssueKind::VideoStall:
+		case IssueKind::VideoJump:
 			return videoFresh;
 		case IssueKind::DesktopAudioStall:
+		case IssueKind::DesktopAudioJump:
 			return desktopFresh;
 		case IssueKind::MicStall:
+		case IssueKind::MicJump:
 			return micFresh;
 		case IssueKind::PersistentDrift: {
 			const double drift = driftForPersistentDetectionMs();
@@ -2258,10 +2792,12 @@ private:
 	void verifyBackgroundRecovery(uint64_t now)
 	{
 		if (backgroundRecoverySucceeded(now)) {
+			consecutiveRecoveryFailures_.store(0);
 			incrementBackgroundRecovery(backgroundRecovery_.target);
 			verifiedRecoveryCount_.fetch_add(1);
 			queueBackgroundEvent(QStringLiteral("Background recovery verified for %1")
 						 .arg(targetName(backgroundRecovery_.target)));
+			queueUserNotification(QStringLiteral("%1 recovered automatically").arg(targetName(backgroundRecovery_.target)), false);
 			backgroundRecovery_ = RecoveryAttempt{};
 			engineDetectionSuppressedUntilNs_ = now + 2ULL * kNsPerSecond;
 			resetEngineConditionTimers();
@@ -2286,16 +2822,32 @@ private:
 		}
 
 		failedRecoveryCount_.fetch_add(1);
+		const uint32_t failures = consecutiveRecoveryFailures_.fetch_add(1) + 1;
 		queueBackgroundEvent(QStringLiteral("Background recovery failed verification after %1; automatic actions entered cooldown")
 					 .arg(targetName(backgroundRecovery_.target)));
+		queueUserNotification(QStringLiteral("Automatic recovery could not verify the fix; protection is in cooldown."), true);
 		backgroundRecovery_ = RecoveryAttempt{};
 		engineDetectionSuppressedUntilNs_ = now +
 			static_cast<uint64_t>(engineSettings_.cooldownSec.load()) * kNsPerSecond;
 		resetEngineConditionTimers();
+		if (failures >= 2) {
+			engineSettings_.automationMode.store(static_cast<int>(AutomationMode::Observe));
+			queueBackgroundEvent(QStringLiteral("Fail-safe activated after repeated failed recoveries; protection changed to Monitor"));
+			QMetaObject::invokeMethod(lifetimeContext_, [this]() {
+				setComboDataBlocked(automationMode_, static_cast<int>(AutomationMode::Observe));
+				setCheckBlocked(automaticProtection_, false);
+				saveConfig();
+			}, Qt::QueuedConnection);
+		}
 	}
 
 	void backgroundEvaluateAutomation(uint64_t now)
 	{
+		if (!setupConfirmedAtomic_.load()) {
+			backgroundRecovery_ = RecoveryAttempt{};
+			resetEngineConditionTimers();
+			return;
+		}
 		if (static_cast<AutomationMode>(engineSettings_.automationMode.load()) != AutomationMode::Automatic) {
 			backgroundRecovery_ = RecoveryAttempt{};
 			resetEngineConditionTimers();
@@ -2332,8 +2884,8 @@ private:
 		const double videoAge = packetAgeMs(0, now);
 		const double desktopAge = packetAgeMs(1, now);
 		const double micAge = packetAgeMs(2, now);
-		const int videoThreshold = engineSettings_.videoStallMs.load();
-		const int audioThreshold = engineSettings_.audioStallMs.load();
+		const int videoThreshold = effectiveStallThresholdMs(0);
+		const int audioThreshold = effectiveStallThresholdMs(1);
 		const bool videoFresh = std::isfinite(videoAge) && videoAge < videoThreshold;
 		const bool desktopFresh = std::isfinite(desktopAge) && desktopAge < audioThreshold;
 		const bool micMapped = sourceMapped(2) && states_[2].enabled.load() && states_[2].active.load();
@@ -2361,7 +2913,28 @@ private:
 		IssueKind issue = IssueKind::None;
 		RecoveryTarget target = RecoveryTarget::None;
 		QString reason;
-		if (engineEntireGroupStallSinceNs_ && now - engineEntireGroupStallSinceNs_ >= kStallConfirmNs) {
+		const double baseline = baselineOffsetMs_.load();
+		const double rawIncidentDrift = std::isfinite(rawOffsetMs_.load()) && std::isfinite(baseline)
+			? rawOffsetMs_.load() - baseline : std::numeric_limits<double>::quiet_NaN();
+		const double jumpConfirmMs = std::max(50.0, engineSettings_.driftThresholdMs.load() * 0.5);
+		const uint64_t videoJump = states_[0].lastVideoJumpWallNs.load();
+		const uint64_t desktopJump = states_[1].lastAudioJumpWallNs.load();
+		const uint64_t micJump = states_[2].lastAudioJumpWallNs.load();
+		if (videoJump && now >= videoJump + kStallConfirmNs && now - videoJump <= kJumpEvidenceWindowNs &&
+		    std::isfinite(rawIncidentDrift) && std::fabs(rawIncidentDrift) >= jumpConfirmMs) {
+			issue = IssueKind::VideoJump;
+			target = RecoveryTarget::Video;
+			reason = QStringLiteral("video timestamp discontinuity produced a persistent %1 ms A/V jump").arg(rawIncidentDrift, 0, 'f', 1);
+		} else if (desktopJump && now >= desktopJump + kStallConfirmNs && now - desktopJump <= kJumpEvidenceWindowNs &&
+			   std::isfinite(rawIncidentDrift) && std::fabs(rawIncidentDrift) >= jumpConfirmMs) {
+			issue = IssueKind::DesktopAudioJump;
+			target = RecoveryTarget::DesktopAudio;
+			reason = QStringLiteral("desktop-audio timestamp discontinuity produced a persistent %1 ms A/V jump").arg(rawIncidentDrift, 0, 'f', 1);
+		} else if (micJump && now >= micJump + kStallConfirmNs && now - micJump <= kJumpEvidenceWindowNs) {
+			issue = IssueKind::MicJump;
+			target = RecoveryTarget::Mic;
+			reason = QStringLiteral("microphone timestamp discontinuity persisted after confirmation");
+		} else if (engineEntireGroupStallSinceNs_ && now - engineEntireGroupStallSinceNs_ >= kStallConfirmNs) {
 			issue = IssueKind::EntireGroupStall;
 			target = RecoveryTarget::EntireGroup;
 			reason = QStringLiteral("all mapped NDI streams remained stale");
@@ -2393,6 +2966,12 @@ private:
 		}
 		if (issue == IssueKind::None)
 			return;
+		if (issue == IssueKind::PersistentDrift) {
+			monitorState_.store(static_cast<int>(MonitorState::Drifting));
+			// Clock drift is a controller problem, not a receiver-lifecycle problem.
+			// Never pulse or rebuild a receiver merely because a gradual slope persisted.
+			return;
+		}
 
 		QString blocked;
 		if (!backgroundResetAllowed(now, blocked))
@@ -2444,6 +3023,7 @@ private:
 		state.lastVideoJumpWallNs.store(0);
 		state.lastVideoJumpErrorNs.store(0);
 		state.firstValidSampleWallNs.store(0);
+		state.observedHealthyGapNs.store(0);
 		state.enabled.store(false);
 		state.active.store(false);
 		state.showing.store(false);
@@ -2660,8 +3240,11 @@ private:
 		const int64_t timestampDelta = signedDelta(timestamp, previousTimestamp);
 		const int64_t wallDelta = signedDelta(now, previousWall);
 		const int64_t error = timestampDelta - wallDelta;
-		if (std::llabs(error) < static_cast<int64_t>(kJumpThresholdNs))
+		if (std::llabs(error) < static_cast<int64_t>(kJumpThresholdNs)) {
+			if (wallDelta > 0 && wallDelta <= static_cast<int64_t>(500ULL * kNsPerMs))
+				updateAtomicMaximum(state->observedHealthyGapNs, static_cast<uint64_t>(wallDelta));
 			return;
+		}
 		const uint64_t previousJump = state->lastAudioJumpWallNs.load();
 		if (previousJump && now - previousJump < kJumpCooldownNs)
 			return;
@@ -2704,6 +3287,19 @@ private:
 		}
 		const char *id = obs_source_get_unversioned_id(source);
 		if (!id || strcmp(id, kDistroAvSourceId) != 0) {
+			obs_source_release(source);
+			state.resetInProgress->store(false);
+			return false;
+		}
+		obs_properties_t *properties = obs_source_properties(source);
+		const bool compatible = properties && obs_properties_get(properties, kPropFrameSync) &&
+			obs_properties_get(properties, kPropLatency) && obs_properties_get(properties, kPropSync) &&
+			obs_properties_get(properties, kPropSource);
+		if (properties)
+			obs_properties_destroy(properties);
+		if (!compatible) {
+			queueBackgroundEvent(QStringLiteral("Recovery blocked for %1: this DistroAV build does not expose the expected receiver properties")
+						 .arg(state.role));
 			obs_source_release(source);
 			state.resetInProgress->store(false);
 			return false;
@@ -2922,6 +3518,26 @@ private:
 	void refreshDiagnostics()
 	{
 		const uint64_t now = os_gettime_ns();
+		if (!lastLifecycleScanNs_ || now - lastLifecycleScanNs_ >= 5ULL * kNsPerSecond) {
+			lastLifecycleScanNs_ = now;
+			refreshSourceLists();
+			for (size_t i = 0; i < states_.size(); ++i) {
+				if (states_[i].sourceName.isEmpty())
+					continue;
+				obs_source_t *bound = sourceForState(states_[i]);
+				if (bound) {
+					obs_source_release(bound);
+					continue;
+				}
+				obs_source_t *replacement = obs_get_source_by_name(states_[i].sourceName.toUtf8().constData());
+				if (replacement) {
+					obs_source_release(replacement);
+					bindSource(i, states_[i].sourceName);
+					quarantineUntilNs_.store(now + kIncidentQuarantineNs);
+					appendEvent(QStringLiteral("Reattached recreated source: %1").arg(states_[i].sourceName), false);
+				}
+			}
+		}
 		flushBackgroundEvents();
 		if (snapshotRebuildResultReady_.exchange(false))
 			restoringSnapshot_ = false;
@@ -2997,6 +3613,59 @@ private:
 		updateSoftSyncStatusLabel();
 		updateObsStats();
 		evaluateAutomation(now);
+		const auto reliability = static_cast<MeasurementReliability>(measurementReliability_.load());
+		const double corrected = softSyncCorrectionActive() ? effectiveDriftMs() : drift;
+		if (compactStatusLabel_) {
+			QString status = QStringLiteral("In sync");
+			if (recovery_.active || backgroundRecovery_.active)
+				status = QStringLiteral("Recovering");
+			else if (reliability == MeasurementReliability::Unreliable)
+				status = QStringLiteral("Measurement unreliable");
+			else if (reliability == MeasurementReliability::Waiting || reliability == MeasurementReliability::Calibrating)
+				status = reliabilityName(reliability);
+			else if (activeSummaryIssue_ == IssueKind::PersistentDrift)
+				status = QStringLiteral("Slow drift");
+			else if (activeSummaryIssue_ != IssueKind::None)
+				status = QStringLiteral("Sync jump or stall");
+			compactStatusLabel_->setText(status);
+		}
+		if (compactOffsetLabel_) {
+			compactOffsetLabel_->setText(std::isfinite(corrected)
+				? QStringLiteral("Corrected offset: %1 ms · Measurement: %2")
+					  .arg(corrected, 0, 'f', 1).arg(reliabilityName(reliability))
+				: QStringLiteral("Corrected offset: — · Measurement: %1").arg(reliabilityName(reliability)));
+		}
+		const bool requiredMapped = sourceMapped(0) && sourceMapped(1);
+		const bool controllerReady = !enableSoftSync_->isChecked() || states_[1].softSync.enabled.load();
+		if (readinessLabel_) {
+			QString readiness;
+			if (!requiredMapped)
+				readiness = QStringLiteral("Setup needed: select video and desktop audio");
+			else if (!setupConfirmed_)
+				readiness = QStringLiteral("Detected: video ‘%1’ · audio ‘%2’%3")
+					.arg(states_[0].sourceName, states_[1].sourceName,
+					     states_[2].sourceName.isEmpty() ? QString() : QStringLiteral(" · mic ‘%1’").arg(states_[2].sourceName));
+			else if (!videoProbeAttached() || !controllerReady)
+				readiness = QStringLiteral("Preparing protection components…");
+			else if (reliability != MeasurementReliability::Reliable)
+				readiness = QStringLiteral("Protection learning: %1").arg(reliabilityName(reliability));
+			else if (automaticProtection_->isChecked())
+				readiness = QStringLiteral("Protected — automatic fixing is ready");
+			else
+				readiness = QStringLiteral("Monitoring only — automatic fixing is paused");
+			readinessLabel_->setText(readiness);
+		}
+		if (confirmSetupButton_)
+			confirmSetupButton_->setVisible(!setupConfirmed_ && requiredMapped);
+		if (effectiveThresholdsLabel_) {
+			effectiveThresholdsLabel_->setText(QStringLiteral("Effective thresholds: video %1 ms · desktop audio %2 ms · mic %3 ms%4")
+				.arg(effectiveStallThresholdMs(0)).arg(effectiveStallThresholdMs(1)).arg(effectiveStallThresholdMs(2))
+				.arg(autoTuneThresholds_->isChecked() ? QStringLiteral(" · automatically tuned") : QStringLiteral(" · manual")));
+		}
+		if (notificationLabel_ && notificationLabel_->isVisible() && notificationHideAtNs_ && now >= notificationHideAtNs_) {
+			notificationLabel_->setVisible(false);
+			notificationHideAtNs_ = 0;
+		}
 		updateOverallSummary();
 		addDiagnosticSample(now, rawOffset);
 		updateIncidentCapture(now);
@@ -3028,7 +3697,7 @@ private:
 			if (packetWall && now >= packetWall) {
 				const double ageMs = static_cast<double>(now - packetWall) / static_cast<double>(kNsPerMs);
 				packetAgeText = QStringLiteral("%1 ms").arg(ageMs, 0, 'f', 1);
-				const int threshold = index == 0 ? videoStallMs_->value() : audioStallMs_->value();
+				const int threshold = effectiveStallThresholdMs(index);
 				fresh = ageMs < static_cast<double>(threshold);
 			} else if (index == 0) {
 				const uint64_t arrival = state.lastVideoArrivalWallNs.load();
@@ -3243,6 +3912,14 @@ private:
 
 	void evaluateAutomation(uint64_t now)
 	{
+		if (!setupConfirmed_) {
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("source setup needs confirmation");
+			clearSuggestedRecovery();
+			automationStatusLabel_->setText(QStringLiteral("Automation: waiting for source setup confirmation"));
+			resetConditionTimers();
+			return;
+		}
 		if (recovery_.active) {
 			currentSummaryState_ = QStringLiteral("recovery in progress for %1").arg(targetName(recovery_.target));
 			showSuggestedRecovery(recovery_.target,
@@ -3268,7 +3945,7 @@ private:
 			automationStatusLabel_->setText(QStringLiteral("Automation: startup/calibration grace (%1 sec remaining)")
 							.arg(static_cast<unsigned long long>((monitoringGraceUntilNs_ - now) / kNsPerSecond)));
 			currentConfidence_ = 0;
-			healthLabel_->setText(QStringLiteral("Detection confidence: 0/100"));
+			healthLabel_->setText(QStringLiteral("Measurement: Calibrating"));
 			return;
 		}
 		if (now < detectionSuppressedUntilNs_) {
@@ -3284,7 +3961,7 @@ private:
 			automationStatusLabel_->setText(QStringLiteral("Automation: waiting for streaming or recording"));
 			resetConditionTimers();
 			currentConfidence_ = 0;
-			healthLabel_->setText(QStringLiteral("Detection confidence: 0/100"));
+			healthLabel_->setText(QStringLiteral("Measurement: Waiting"));
 			return;
 		}
 		if (!sourceEligibilitySatisfied()) {
@@ -3294,7 +3971,7 @@ private:
 			automationStatusLabel_->setText(QStringLiteral("Automation: waiting for mapped sources to become active/showing"));
 			resetConditionTimers();
 			currentConfidence_ = 0;
-			healthLabel_->setText(QStringLiteral("Detection confidence: 0/100"));
+			healthLabel_->setText(QStringLiteral("Measurement: Waiting"));
 			return;
 		}
 
@@ -3306,30 +3983,33 @@ private:
 			automationStatusLabel_->setText(QStringLiteral("Automation: %1").arg(readinessReason));
 			resetConditionTimers();
 			currentConfidence_ = 0;
-			healthLabel_->setText(QStringLiteral("Detection confidence: 0/100 | waiting for data"));
+			healthLabel_->setText(QStringLiteral("Measurement: Waiting for valid timestamps"));
 			return;
 		}
 
 		const double videoAge = packetAgeMs(0, now);
 		const double desktopAge = packetAgeMs(1, now);
 		const double micAge = packetAgeMs(2, now);
-		const bool videoFresh = videoAge < videoStallMs_->value();
-		const bool desktopFresh = desktopAge < audioStallMs_->value();
+		const int videoThreshold = effectiveStallThresholdMs(0);
+		const int desktopThreshold = effectiveStallThresholdMs(1);
+		const int micThreshold = effectiveStallThresholdMs(2);
+		const bool videoFresh = videoAge < videoThreshold;
+		const bool desktopFresh = desktopAge < desktopThreshold;
 		const bool micMapped = !states_[2].sourceName.isEmpty() && states_[2].enabled.load() && states_[2].active.load();
 		const uint64_t micFirst = states_[2].firstValidSampleWallNs.load();
 		const bool micExpected = micMapped && micFirst && now >= micFirst && now - micFirst >= kFirstSampleGraceNs;
-		const bool micStaleIfExpected = !micExpected || micAge >= audioStallMs_->value();
+		const bool micStaleIfExpected = !micExpected || micAge >= micThreshold;
 		const bool bothAudioStalled = enableFreezeDetection_->isChecked() && videoFresh && micExpected &&
-					      desktopAge >= audioStallMs_->value() && micAge >= audioStallMs_->value();
+					      desktopAge >= desktopThreshold && micAge >= micThreshold;
 		const bool entireGroupStalled = enableFreezeDetection_->isChecked() && !videoFresh && !desktopFresh &&
 					       micStaleIfExpected;
 
 		const bool videoStalled = enableFreezeDetection_->isChecked() && desktopFresh &&
-					  videoAge >= videoStallMs_->value();
+					  videoAge >= videoThreshold;
 		const bool desktopStalled = enableFreezeDetection_->isChecked() && videoFresh &&
-					    desktopAge >= audioStallMs_->value();
+					    desktopAge >= desktopThreshold;
 		const bool micStalled = enableFreezeDetection_->isChecked() && micExpected && (videoFresh || desktopFresh) &&
-					micAge >= audioStallMs_->value();
+					micAge >= micThreshold;
 		updateConditionTimer(videoStalled, videoStallSinceNs_, now);
 		updateConditionTimer(desktopStalled, desktopStallSinceNs_, now);
 		updateConditionTimer(micStalled, micStallSinceNs_, now);
@@ -3346,7 +4026,31 @@ private:
 		QString reason;
 		int confidence = 0;
 
-		if (entireGroupStallSinceNs_ && now - entireGroupStallSinceNs_ >= kStallConfirmNs) {
+		const double baselineNow = baselineOffsetMs_.load();
+		const double rawIncidentDrift = std::isfinite(rawOffsetMs_.load()) && std::isfinite(baselineNow)
+			? rawOffsetMs_.load() - baselineNow : std::numeric_limits<double>::quiet_NaN();
+		const double jumpConfirmMs = std::max(50.0, driftThresholdMs_->value() * 0.5);
+		const uint64_t videoJump = states_[0].lastVideoJumpWallNs.load();
+		const uint64_t desktopJump = states_[1].lastAudioJumpWallNs.load();
+		const uint64_t micJump = states_[2].lastAudioJumpWallNs.load();
+		if (videoJump && now >= videoJump + kStallConfirmNs && now - videoJump <= kJumpEvidenceWindowNs &&
+		    std::isfinite(rawIncidentDrift) && std::fabs(rawIncidentDrift) >= jumpConfirmMs) {
+			issue = IssueKind::VideoJump;
+			target = RecoveryTarget::Video;
+			confidence = 95;
+			reason = QStringLiteral("Confirmed video timestamp jump changed A/V timing by %1 ms").arg(rawIncidentDrift, 0, 'f', 1);
+		} else if (desktopJump && now >= desktopJump + kStallConfirmNs && now - desktopJump <= kJumpEvidenceWindowNs &&
+			   std::isfinite(rawIncidentDrift) && std::fabs(rawIncidentDrift) >= jumpConfirmMs) {
+			issue = IssueKind::DesktopAudioJump;
+			target = RecoveryTarget::DesktopAudio;
+			confidence = 95;
+			reason = QStringLiteral("Confirmed desktop-audio timestamp jump changed A/V timing by %1 ms").arg(rawIncidentDrift, 0, 'f', 1);
+		} else if (micJump && now >= micJump + kStallConfirmNs && now - micJump <= kJumpEvidenceWindowNs) {
+			issue = IssueKind::MicJump;
+			target = RecoveryTarget::Mic;
+			confidence = 90;
+			reason = QStringLiteral("Confirmed microphone timestamp discontinuity");
+		} else if (entireGroupStallSinceNs_ && now - entireGroupStallSinceNs_ >= kStallConfirmNs) {
 			issue = IssueKind::EntireGroupStall;
 			target = RecoveryTarget::EntireGroup;
 			confidence = 99;
@@ -3402,18 +4106,33 @@ private:
 			    std::abs(displayedRate) >= 30.0 && displayedRate * drift > 0.0)
 				confidence = std::min(100, confidence + 10);
 		}
-		currentConfidence_ = confidence;
-		healthLabel_->setText(QStringLiteral("Detection confidence: %1/100%2")
-					  .arg(confidence)
-					  .arg(recentJumpEvidence(now) ? QStringLiteral(" | recent timestamp jump") : QString()));
+		currentConfidence_ = confidence; // retained in incident files for v0.3.x report compatibility
+		const auto reliability = static_cast<MeasurementReliability>(measurementReliability_.load());
+		healthLabel_->setText(QStringLiteral("Measurement: %1%2")
+					  .arg(reliabilityName(reliability))
+					  .arg(recentJumpEvidence(now) ? QStringLiteral(" | incident samples quarantined") : QString()));
 
 		if (issue == IssueKind::None) {
+			monitorState_.store(static_cast<int>(MonitorState::Stable));
 			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
 			currentSummaryState_ = QStringLiteral("healthy now");
 			clearSuggestedRecovery();
 			automationStatusLabel_->setText(QStringLiteral("Automation: %1 | healthy")
 							.arg(modeName(currentMode())));
 			lastObservedIssueKey_.clear();
+			return;
+		}
+		if (issue == IssueKind::PersistentDrift) {
+			monitorState_.store(static_cast<int>(MonitorState::Drifting));
+			setSummaryIssue(issue, RecoveryTarget::None);
+			currentSummaryState_ = engineSettings_.softSyncEnabled.load()
+				? QStringLiteral("slow drift correction active")
+				: QStringLiteral("slow drift detected; enable Drift Controller to correct it");
+			clearSuggestedRecovery();
+			automationStatusLabel_->setText(QStringLiteral("Drift Controller: %1")
+							.arg(engineSettings_.softSyncEnabled.load() ? QStringLiteral("correcting")
+													 : QStringLiteral("off — monitoring only")));
+			handleDetectedIssue(now, issue, RecoveryTarget::None, reason, confidence);
 			return;
 		}
 
@@ -3458,6 +4177,16 @@ private:
 	{
 		const QString key = QStringLiteral("%1:%2").arg(static_cast<int>(issue)).arg(static_cast<int>(target));
 		startIncident(reason, target, confidence);
+		if (issue == IssueKind::PersistentDrift) {
+			if (key != lastObservedIssueKey_ || !lastObservedIssueNs_ || now - lastObservedIssueNs_ >= kObserveRepeatNs) {
+				appendEvent(engineSettings_.softSyncEnabled.load()
+					? QStringLiteral("Slow drift detected; Drift Controller is correcting it: %1").arg(reason)
+					: QStringLiteral("Slow drift detected; no receiver reset will be attempted: %1").arg(reason), false);
+				lastObservedIssueKey_ = key;
+				lastObservedIssueNs_ = now;
+			}
+			return;
+		}
 		const AutomationMode mode = currentMode();
 
 		if (mode == AutomationMode::Observe) {
@@ -3583,6 +4312,10 @@ private:
 	{
 		const bool recovered = recoverySucceeded(now);
 		if (recovered) {
+			consecutiveRecoveryFailures_.store(0);
+			const bool wasSelfTest = recovery_.issue == IssueKind::None &&
+				recovery_.reason == QStringLiteral("user-requested protection self-test");
+			const RecoveryTarget recoveredTarget = recovery_.target;
 			incrementVerifiedSourceRecoveries(recovery_.target);
 			verifiedRecoveryCount_++;
 			appendEvent(QStringLiteral("Recovery verified: %1 is fresh and the triggering condition cleared")
@@ -3592,6 +4325,9 @@ private:
 			currentSummaryState_ = QStringLiteral("healthy after a verified recovery");
 			detectionSuppressedUntilNs_ = now + 2ULL * kNsPerSecond;
 			clearSuggestedRecovery();
+			showNotification(wasSelfTest
+				? QStringLiteral("Protection test passed: receivers recovered and settings were restored.")
+				: QStringLiteral("%1 recovered successfully").arg(targetName(recoveredTarget)), false);
 			return;
 		}
 
@@ -3618,6 +4354,7 @@ private:
 
 		const RecoveryTarget failedTarget = recovery_.target;
 		failedRecoveryCount_++;
+		const uint32_t failures = consecutiveRecoveryFailures_.fetch_add(1) + 1;
 		currentSummaryState_ = QStringLiteral("recovery verification failed; manual review suggested");
 		appendEvent(QStringLiteral("Recovery failed verification after %1. Automatic actions are now in cooldown; manual review required")
 				    .arg(targetName(failedTarget)));
@@ -3626,23 +4363,34 @@ private:
 		showSuggestedRecovery(failedTarget == RecoveryTarget::EntireGroup ? RecoveryTarget::EntireGroup : failedTarget,
 				      QStringLiteral("Automatic verification failed. Review the live diagnostics, then use the highlighted recovery action if the problem remains."),
 				      100);
+		if (failures >= 2) {
+			setComboDataBlocked(automationMode_, static_cast<int>(AutomationMode::Observe));
+			setCheckBlocked(automaticProtection_, false);
+			updateEngineSettings();
+			saveConfig();
+			appendEvent(QStringLiteral("Fail-safe activated after repeated failed recoveries; protection changed to Monitor"), false);
+			showNotification(QStringLiteral("Automatic Protection paused after repeated failed recoveries. Details are available in diagnostics."), true);
+		}
 	}
 
 	bool recoverySucceeded(uint64_t now) const
 	{
-		const bool videoFresh = packetAgeMs(0, now) < videoStallMs_->value() * 0.75;
-		const bool desktopFresh = packetAgeMs(1, now) < audioStallMs_->value() * 0.75;
-		const bool micFresh = packetAgeMs(2, now) < audioStallMs_->value() * 0.75;
+		const bool videoFresh = packetAgeMs(0, now) < effectiveStallThresholdMs(0) * 0.75;
+		const bool desktopFresh = packetAgeMs(1, now) < effectiveStallThresholdMs(1) * 0.75;
+		const bool micFresh = packetAgeMs(2, now) < effectiveStallThresholdMs(2) * 0.75;
 		switch (recovery_.issue) {
 		case IssueKind::EntireGroupStall:
 			return videoFresh && desktopFresh && (states_[2].sourceName.isEmpty() || micFresh);
 		case IssueKind::BothAudioStall:
 			return desktopFresh && micFresh;
 		case IssueKind::VideoStall:
+		case IssueKind::VideoJump:
 			return videoFresh;
 		case IssueKind::DesktopAudioStall:
+		case IssueKind::DesktopAudioJump:
 			return desktopFresh;
 		case IssueKind::MicStall:
+		case IssueKind::MicJump:
 			return micFresh;
 		case IssueKind::PersistentDrift: {
 			const double drift = driftForPersistentDetectionMs();

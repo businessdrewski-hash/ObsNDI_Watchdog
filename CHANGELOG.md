@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.5.0
+
+- Added a hands-free first-run path that detects likely DistroAV video, desktop-audio, and microphone roles.
+- Added one-click source confirmation; automatic actions stay locked until the proposed mapping is confirmed.
+- Replaced the normal mode selector with a single Automatic Protection switch while retaining Monitor/Ask/Auto under Protection settings.
+- Enabled Drift Controller automatically with Automatic Protection and recommends linked mic correction when both audio sources expose the same sender identity.
+- Added adaptive stall thresholds learned from healthy callback gaps; the learned effective numbers remain visible.
+- Added plain-language readiness states and temporary success/failure notifications on the compact dashboard.
+- Added a controlled Protection Test that captures settings, rebuilds the mapped group, restores it non-destructively, and verifies fresh timestamps.
+- Added one-click privacy-conscious support-report export with measurements, controller state, thresholds, and source health counters.
+- Kept raw/filtered offsets, baseline, slope, ppm, correction validation, packet ages, timestamps, jumps, resets, properties, and event history in expandable diagnostics.
+
+## v0.4.0
+
+- Moved every major section chevron to the left, immediately beside its title.
+- Reduced section-toggle width and allowed titles to yield horizontal space so the chevrons remain visible in very narrow OBS docks.
+- Added a compact everyday dashboard with status, corrected offset, Monitor/Ask/Auto mode, and contextual Fix button.
+- Separated timestamp jumps/stalls from slow drift; gradual drift can no longer reset receivers.
+- Added per-source jump classification and targeted jump recovery.
+- Replaced the misleading confidence display with Waiting, Calibrating, Reliable, and Unreliable measurement states.
+- Quarantined incident/recovery samples from calibration and drift estimation.
+- Changed calibration to require a stable, reliable window and persist the last known baseline.
+- Paused and recentered Drift Controller during incidents and added correction-output validation and saturation reporting.
+- Added repeated-failure fallback to Monitor mode, DistroAV property compatibility checks, source recreation handling, and v3-to-v4 settings migration.
+- Added dependency-free behavior tests and a load/save/runtime audit for all persisted parameters.
+
 ## v0.3.4 — High-range Adaptive Sync hotfix
 
 - Raised the configurable Adaptive Soft Sync ceiling from 200 ppm to 5000 ppm.

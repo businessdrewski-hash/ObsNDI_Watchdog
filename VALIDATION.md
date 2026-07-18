@@ -1,15 +1,21 @@
-# Validation notes — v0.3.3
+# Validation notes — v0.5.0
 
-Validated in the dependency-free model and source review:
+Dependency-free checks cover:
 
-- Internal measurements still run every 250 ms and visible diagnostics refresh every 1000 ms.
-- Persistent drift detection uses corrected output drift only while Adaptive Soft Sync and its desktop filter are active.
-- With Adaptive Soft Sync disabled, threshold behavior returns to raw transport drift.
-- A raw `-250 ms` drift corrected to approximately `0 ms` does not trigger the ordinary threshold in Soft Sync mode.
-- The same raw value triggers normally when Soft Sync is disabled.
-- Corrected drift beyond the configured threshold still triggers recovery.
-- Full-group and targeted reset restoration continue to use non-destructive settings updates and restore OBS-level source state.
-- Major UI sections are collapsible and technical diagnostics default to hidden.
-- GitHub Actions and installer metadata are v0.3.3.
+- Automatic actions remain disabled until source assignments are confirmed.
+- Adaptive thresholds never go below configured safety values and cap at 10 seconds.
+- Automatic Protection maps to Auto; disabling it maps to Monitor while monitoring continues.
+- Slow drift still maps only to Drift Controller or alert behavior, never receiver resets.
+- Jump/stall classification, sample quarantine, reliability gating, non-destructive restoration, correction validation, and repeated-failure fail-safe behavior remain covered.
+- All persisted controls have load, save, signal, and runtime paths.
+- Source detection, Protection Test, support-report export, and effective-threshold code paths are present.
+- Installer, workflow, and build metadata are v0.5.0.
 
-The Windows DLL and installer must still be compiled by the included GitHub Actions workflow for full OBS runtime validation.
+Run:
+
+```text
+python3 tests/test_detection_model.py
+python3 tests/test_parameter_paths.py
+```
+
+The Windows DLL and installer must still be compiled by the included GitHub Actions workflow for full OBS/DistroAV runtime validation.

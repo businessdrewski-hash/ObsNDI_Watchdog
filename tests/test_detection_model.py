@@ -1,4 +1,4 @@
-"""Dependency-free sanity model for Sync Guardian v0.3.2 behavior."""
+"""Dependency-free sanity model for Sync Guardian v0.5.0 behavior."""
 
 VIDEO_STALL_MS = 1000
 AUDIO_STALL_MS = 1000
@@ -38,7 +38,7 @@ def choose_issue(video_age, desktop_age, mic_age, raw_drift, drift_duration_ms, 
         return "mic"
     detection_drift = corrected_drift if soft_sync_enabled and corrected_drift is not None else raw_drift
     if video_fresh and desktop_fresh and abs(detection_drift) >= DRIFT_THRESHOLD_MS and drift_duration_ms >= DRIFT_PERSISTENCE_MS:
-        return "video" if detection_drift < 0 else "desktop"
+        return "drift"
     return None
 
 
@@ -60,6 +60,30 @@ def reset_restores_original_framesync(original_framesync):
     pulse_value = not original_framesync
     restored_value = original_framesync
     return pulse_value, restored_value
+
+
+def mitigation_for(issue, drift_controller_enabled):
+    if issue == "drift":
+        return "controller" if drift_controller_enabled else "alert"
+    return "receiver-recovery" if issue else "none"
+
+
+def measurement_reliability(fresh, valid, quarantined, sample_count, span_ms):
+    if quarantined or not fresh or not valid:
+        return "unreliable"
+    if sample_count < 24 or span_ms < 10_000:
+        return "calibrating"
+    return "reliable"
+
+
+def effective_stall_threshold(configured_ms, largest_healthy_gap_ms, auto_tune=True):
+    if not auto_tune or not largest_healthy_gap_ms:
+        return configured_ms
+    return max(configured_ms, min(10_000, largest_healthy_gap_ms * 4 + 250))
+
+
+def automatic_actions_allowed(setup_confirmed, mode):
+    return setup_confirmed and mode == "auto"
 
 
 
@@ -97,8 +121,23 @@ def run():
     assert choose_issue(1200, 1200, 1200, 0, 0) == "group"
     assert choose_issue(1200, 1200, 0, 0, 0, mic_expected=False) == "group"
     assert choose_issue(20, 20, 20, -250, 9_000) is None
-    assert choose_issue(20, 20, 20, -250, 10_000) == "video"
-    assert choose_issue(20, 20, 20, 250, 10_000) == "desktop"
+    assert choose_issue(20, 20, 20, -250, 10_000) == "drift"
+    assert choose_issue(20, 20, 20, 250, 10_000) == "drift"
+    assert mitigation_for("drift", True) == "controller"
+    assert mitigation_for("drift", False) == "alert"
+    assert mitigation_for("video", True) == "receiver-recovery"
+
+    assert measurement_reliability(True, True, True, 100, 30_000) == "unreliable"
+    assert measurement_reliability(False, True, False, 100, 30_000) == "unreliable"
+    assert measurement_reliability(True, True, False, 23, 30_000) == "calibrating"
+    assert measurement_reliability(True, True, False, 24, 9_999) == "calibrating"
+    assert measurement_reliability(True, True, False, 24, 10_000) == "reliable"
+    assert effective_stall_threshold(1000, 20) == 1000
+    assert effective_stall_threshold(1000, 300) == 1450
+    assert effective_stall_threshold(1000, 300, auto_tune=False) == 1000
+    assert not automatic_actions_allowed(False, "auto")
+    assert not automatic_actions_allowed(True, "monitor")
+    assert automatic_actions_allowed(True, "auto")
 
     # A -1.5 ms/min trend needs approximately +25 ppm (slightly slower audio).
     assert abs(ppm_for_rate(-1.5) - 25.0) < 1e-6
@@ -118,11 +157,13 @@ def run():
     assert choose_issue(20, 20, 20, raw_transport_drift, 10_000,
                         soft_sync_enabled=True, corrected_drift=corrected_output_drift) is None
     assert choose_issue(20, 20, 20, raw_transport_drift, 10_000,
-                        soft_sync_enabled=False, corrected_drift=corrected_output_drift) == "video"
+                        soft_sync_enabled=False, corrected_drift=corrected_output_drift) == "drift"
 
-    # If corrected output itself remains beyond threshold, recovery still triggers.
+    # If corrected output itself remains beyond threshold, drift is reported but
+    # receiver recovery is still forbidden.
     assert choose_issue(20, 20, 20, -250.0, 10_000,
-                        soft_sync_enabled=True, corrected_drift=-225.0) == "video"
+                        soft_sync_enabled=True, corrected_drift=-225.0) == "drift"
+    assert mitigation_for("drift", True) != "receiver-recovery"
 
     # Reset pulses may temporarily invert FrameSync, but must restore the exact
     # pre-reset value for both audio-pass-through and video FrameSync setups.
@@ -160,7 +201,7 @@ def run():
     correction_ppm = ppm_for_rate(-1.5) if soft_sync_enabled else 0.0
     assert correction_ppm == 0.0
 
-    print("Sync Guardian v0.3.2 detection, reset-preservation, and Soft Sync model checks passed")
+    print("Sync Guardian v0.5.0 hands-free protection, jump/drift, reliability, and controller checks passed")
 
 
 if __name__ == "__main__":
