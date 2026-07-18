@@ -106,7 +106,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler not found.' }
-          & $iscc "/DMyAppVersion=0.3.3" "/DSourceRoot=$env:GITHUB_WORKSPACE\obs-install" "/DOutputRoot=$env:GITHUB_WORKSPACE\dist" "$env:GITHUB_WORKSPACE\installer\SyncGuardian.iss"
+          & $iscc "/DMyAppVersion=0.5.0" "/DSourceRoot=$env:GITHUB_WORKSPACE\obs-install" "/DOutputRoot=$env:GITHUB_WORKSPACE\dist" "$env:GITHUB_WORKSPACE\installer\SyncGuardian.iss"
 
       - name: Generate checksums
         shell: pwsh
@@ -120,7 +120,7 @@ jobs:
       - name: Upload install-ready plugin
         uses: actions/upload-artifact@v4
         with:
-          name: sync-guardian-0.3.3-windows-x64
+          name: sync-guardian-0.5.0-windows-x64
           path: dist/
           if-no-files-found: error
           retention-days: 30
