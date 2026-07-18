@@ -220,78 +220,39 @@ The generated artifact contains:
 
 The source package itself does not include a precompiled Windows DLL.
 
-## Basic version history
+## Changelog
+
+### v0.5.0 — Hands-free protection and easier setup
+
+- Automatically proposes DistroAV video, desktop-audio, and microphone assignments, then requires one confirmation before automatic actions are allowed.
+- Added a single **Automatic Protection** switch, plain-language readiness states, adaptive stall thresholds, source-clock-based mic-link suggestions, and temporary action notifications.
+- Added **Test protection** for a controlled rebuild/restore/verification cycle and **Export support report** for privacy-conscious diagnostics.
+- Reduced the normal dock to the essential protection card while keeping all timing numbers and manual controls expandable.
+
+### v0.4.0 — Separate drift correction from jump recovery
+
+- Separated gradual clock drift from timestamp jumps and stalls: drift uses the Drift Controller, while confirmed discontinuities use targeted receiver recovery.
+- Added per-source jump classification, incident-sample quarantine, stability-based calibration, real measurement-reliability states, correction-output validation, and correction-range warnings.
+- Added repeated-failure fallback to Monitor mode, automatic source recreation handling, DistroAV compatibility checks, and v3 settings migration.
+- Moved every section chevron to the left and made the compact dock scale correctly at narrow widths.
+
+### v0.3.x — Reliable background monitoring and correction
+
+- Moved monitoring, reset restoration, verification, escalation, and cooldown timing to an independent 250 ms watchdog.
+- Added robust median/trend estimation and Adaptive Soft Sync with configurable ppm limits, smooth catch-up, slew control, and corrected-output drift reporting.
+- Added non-destructive restoration of DistroAV settings and OBS audio/runtime properties.
+- Added compact collapsible diagnostics, the private video timestamp probe, installer generation, portable packaging, and checksums.
+
+### v0.2.x — Automatic detection and usable diagnostics
+
+- Added automatic stall/drift detection, Monitor/Ask/Auto modes, cooldowns, startup grace, verification, escalation, event logging, source validation, and clearer dock behavior.
+- Improved small-window scaling, visual grouping, diagnostic summaries, GitHub Actions packaging, and video frame/timestamp readiness tracking.
 
 ### v0.1.x — Manual recovery foundation
 
-- Added an OBS dock for mapped DistroAV sources
-- Added manual targeted receiver resets
-- Added basic saved-state restoration
-- Established the reset-pulse approach for receiver recreation
+- Added the OBS dock, mapped DistroAV roles, targeted receiver resets, saved-state restoration, and the reset-pulse receiver recreation method.
 
-### v0.2.0 — Automatic monitoring and recovery
-
-- Added automatic stall and drift detection
-- Added Observe, Ask, and automatic operating modes
-- Added cooldowns, startup grace periods, verification, and escalation
-- Added event logging and persistent-drift handling
-
-### v0.2.1 — Dock usability
-
-- Added scrolling and improved dock behavior at smaller sizes
-- Made the interface more practical for normal OBS layouts
-
-### v0.2.2 — Visual cleanup
-
-- Added clearer button states and highlighting
-- Reduced unnecessary visual density
-- Improved general layout and control grouping
-
-### v0.2.3 — Packaging and diagnostics
-
-- Added a cleaner drag-and-drop OBS package structure
-- Added more understandable diagnostic summaries
-- Improved distribution for GitHub Actions builds
-
-### v0.2.4 — Reliable video timestamp probe
-
-- Replaced unreliable video-frame polling with a private pass-through async video filter
-- Added separate frame-arrival and timestamp-advancement tracking
-- Prevented false `inf` packet-age stalls before valid timestamps were available
-- Added probe-ready and waiting states
-- Improved startup settling and source validation
-
-### v0.3.0 — Background watchdog and Adaptive Soft Sync
-
-- Moved safety-critical monitoring and reset timing away from Qt hover/focus behavior
-- Added 1000 ms display refresh with 250 ms internal sampling
-- Expanded median filtering and robust trend estimation
-- Added plain-English direction descriptions
-- Improved dark-theme text contrast
-- Preserved original FrameSync and DistroAV settings during reset pulses
-- Added experimental Adaptive Soft Sync
-- Added installer and portable-package generation
-
-### v0.3.1 — Non-destructive settings preservation
-
-- Replaced destructive source-setting restoration with non-destructive updates
-- Preserved DistroAV and OBS-level source properties during targeted resets and full-group rebuilds
-- Applied the same preservation behavior to saved-state restoration
-
-### v0.3.4 — Compact collapsible interface
-
-- True single-line collapsed headers
-- Small chevron toggles instead of large Show/Hide buttons
-- Reduced vertical padding and section spacing
-
-### v0.3.2 — Corrected-drift logic and compact diagnostics
-
-- Changed persistent-drift evaluation to use corrected output drift while Adaptive Soft Sync is active
-- Kept raw transport drift available for diagnosis
-- Added a prominent color-coded drift line
-- Added inline corrected-drift reporting
-- Made every major dock section collapsible
-- Hid technical diagnostics behind a dedicated show/hide control
+See [CHANGELOG.md](CHANGELOG.md) for the detailed release history.
 
 ## Important limitations
 
